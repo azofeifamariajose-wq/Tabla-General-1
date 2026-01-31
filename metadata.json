@@ -1,0 +1,5 @@
+{
+  "name": "Tabla General 3.0",
+  "description": "A dual-agent AI system for extracting and auditing medical data from clinical trial PDFs using Gemini 2.5/3.0 models.",
+  "requestFramePermissions": []
+}
