@@ -146,6 +146,122 @@ const safeJsonParse = <T>(jsonString: string, fallback: T): T => {
   }
 };
 
+// --- CORRELATION BRANCH (Normalization Addon) ---
+
+const BRAND_CORRELATIONS: Record<string, string> = {
+  "adacel": "Adacel®",
+  "boostrix": "Boostrix®",
+  "combe five": "ComBE Five®",
+  "daptacel": "Daptacel®",
+  "easyfive-tt": "Easyfive-TT®",
+  "eupenta": "Eupenta®",
+  "hexaxim": "Hexaxim®",
+  "infanrix": "Infanrix®",
+  "infanrix-ipv": "Infanrix®-IPV",
+  "infanrix hexa": "Infanrix® Hexa",
+  "infanrix penta": "Infanrix Penta®",
+  "pediarix": "Pediarix®",
+  "pentavac pfs": "Pentavac® PFS/SD",
+  "pentavac sd": "Pentavac® PFS/SD",
+  "pentavac": "Pentavac® PFS/SD",
+  "pentacel": "Pentacel®",
+  "pentaxim": "Pentaxim®",
+  "pentalab": "Pentalab®",
+  "quadracel": "Quadracel®",
+  "quinvaxem": "Quinvaxem®",
+  "tetraxim": "Tetraxim®",
+  "tritanrix": "Tritanrix®",
+  "vaxelis": "Vaxelis®"
+};
+
+const MANUFACTURER_CORRELATIONS: Record<string, string> = {
+  "biological evans private limited": "Biological E. Limited",
+  "glaxosmithkline": "GSK",
+  "smithkline beecham biologicals": "GSK",
+  "smithkline beecham": "GSK",
+  "glaxo laboratories": "GSK",
+  "glaxo holdings": "GSK",
+  "smithkline beecham plc": "GSK",
+  "glaxo wellcome plc": "GSK",
+  "glaxosmithkline plc": "GSK",
+  "gsk plc": "GSK",
+  "lg chemical": "LG Chem Ltd.",
+  "lak hui chemical industrial corp.": "LG Chem Ltd.",
+  "lucky chemical industries co. ltd.": "LG Chem Ltd.",
+  "lucky ltd.": "LG Chem Ltd.",
+  "lg chem investment ltd.": "LG Chem Ltd.",
+  "panacea biotec limited": "Panacea Biotec Ltd.",
+  "panacea drugs private limited": "Panacea Biotec Ltd.",
+  "radicura pharmaceuticals": "Panacea Biotec Ltd.",
+  "radicura pharma": "Panacea Biotec Ltd.",
+  "panacea biotec pharma": "Panacea Biotec Ltd.",
+  "panacea biotec pharma limited": "Panacea Biotec Ltd.",
+  "parc-vaccinogène": "PT Bio Farma (Persero)",
+  "landskoepoek inrichting en instituut pasteur": "PT Bio Farma (Persero)",
+  "bandung boeki kenkyusho": "PT Bio Farma (Persero)",
+  "pn pasteur": "PT Bio Farma (Persero)",
+  "pn bio farma": "PT Bio Farma (Persero)",
+  "perum bio farma": "PT Bio Farma (Persero)",
+  "institut pasteur": "Sanofi Pasteur",
+  "pasteur vaccins": "Sanofi Pasteur",
+  "pasteur mérieux connaught": "Sanofi Pasteur",
+  "aventis pasteur": "Sanofi Pasteur",
+  "sanofi": "Sanofi Pasteur",
+  "serum institute of india private": "Serum Institute of India",
+  "sii": "Serum Institute of India",
+  "serum institute of india private limited": "Serum Institute of India"
+};
+
+/**
+ * Applies correlation logic to extracted items.
+ * Normalizes Brand Names and Manufacturer names based on strict interpretation rules.
+ */
+const applyCorrelationRules = (items: ExtractionItem[]): ExtractionItem[] => {
+  return items.map(item => {
+    const newItem = { ...item };
+    if (!newItem.answer) return newItem;
+
+    // Clean answer for matching (remove trademark symbols temporarily, lowercase, trim)
+    const lowerAnswer = newItem.answer.toLowerCase().replace(/[®™]/g, '').trim();
+    const lowerQuestion = item.question.toLowerCase();
+    
+    // 1. Check if question relates to Brand Name
+    if (lowerQuestion.includes("brand") || lowerQuestion.includes("commercial name")) {
+        // Sort keys by length descending to ensure "Pentavac PFS" is matched before "Pentavac"
+        const sortedKeys = Object.keys(BRAND_CORRELATIONS).sort((a, b) => b.length - a.length);
+        
+        for (const key of sortedKeys) {
+            // Check for containment. If the extracted answer contains the key, we map it.
+            if (lowerAnswer.includes(key)) {
+                newItem.answer = BRAND_CORRELATIONS[key];
+                // Append logic note if changed
+                if (newItem.answer !== item.answer) {
+                    newItem.reasoning = (newItem.reasoning || "") + ` [Auto-Correlated: matched "${key}" -> normalized to "${BRAND_CORRELATIONS[key]}"]`;
+                }
+                break; // Stop after first match
+            }
+        }
+    }
+
+    // 2. Check if question relates to Manufacturer
+    if (lowerQuestion.includes("manufacturer") || lowerQuestion.includes("pharmaceutical co")) {
+         const sortedKeys = Object.keys(MANUFACTURER_CORRELATIONS).sort((a, b) => b.length - a.length);
+         
+         for (const key of sortedKeys) {
+             if (lowerAnswer.includes(key)) {
+                newItem.answer = MANUFACTURER_CORRELATIONS[key];
+                if (newItem.answer !== item.answer) {
+                    newItem.reasoning = (newItem.reasoning || "") + ` [Auto-Correlated: matched "${key}" -> normalized to "${MANUFACTURER_CORRELATIONS[key]}"]`;
+                }
+                break;
+             }
+         }
+    }
+    
+    return newItem;
+  });
+};
+
 // --- AGENTS ---
 
 const EXTRACTION_SCHEMA: Schema = {
@@ -263,7 +379,13 @@ export const runExtractionAgent = async (
     // Agent 1 uses Flash for efficiency on bulk extraction
     const response = await generateContentWithRetry(ai, MODEL_FLASH, {
       contents: { parts: [filePart, { text: prompt }] },
-      config: { responseMimeType: "application/json", responseSchema: EXTRACTION_SCHEMA, thinkingConfig: { thinkingBudget: 4096 } }
+      config: { 
+          responseMimeType: "application/json", 
+          responseSchema: EXTRACTION_SCHEMA, 
+          // Increased thinking budget and maxOutputTokens to handle large blocks (like Section 14)
+          thinkingConfig: { thinkingBudget: 4096 },
+          maxOutputTokens: 30000 
+      }
     });
 
     // Use safeJsonParse to ensure robustness against truncation or special chars
@@ -277,12 +399,20 @@ export const runExtractionAgent = async (
 
     onProgress(i + 1, blocks.length);
   }
-  return { items: allItems, usage: totalUsage };
+
+  // --- APPLY CORRELATION BRANCH ADDON ---
+  // Normalizes brands and manufacturers before returning results
+  // const correlatedItems = applyCorrelationRules(allItems); // Correlation turned off per request
+  // Passing allItems directly instead of correlatedItems
+  const finalItems = allItems;
+
+  return { items: finalItems, usage: totalUsage };
 };
 
 export const runAuditAgent = async (
   file: File, 
   originalData: ExtractionItem[], 
+  schemaDef: SchemaDef, // Added SchemaDef to context
   onProgress: (current: number, total: number) => void
 ): Promise<{items: AuditItem[], usage: TokenUsage}> => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
@@ -294,21 +424,64 @@ export const runAuditAgent = async (
         return acc;
     }, {} as Record<number, ExtractionItem[]>);
 
-    const blockIds = Object.keys(itemsByBlock).map(Number).sort((a, b) => a - b);
+    // Iterate over Schema blocks to ensure coverage, even if extraction missed it.
+    const blocks = schemaDef.blocks;
     const auditedItems: AuditItem[] = [];
     let totalUsage: TokenUsage = { promptTokens: 0, outputTokens: 0, totalTokens: 0 };
 
-    for (let i = 0; i < blockIds.length; i++) {
-        const blockId = blockIds[i];
-        const prompt = `STRICT MEDICAL AUDITOR. File: ${file.name}. Verify extraction results for Block ${blockId} against PDF. 
-        Reject any data not explicitly found in this file.
+    for (let i = 0; i < blocks.length; i++) {
+        const block = blocks[i];
+        const blockItems = itemsByBlock[block.block_number] || [];
+
+        const prompt = `STRICT MEDICAL AUDITOR. File: ${file.name}. 
+        Reviewing Block ${block.block_number}: ${block.block_name}.
+
+        YOU HAVE 5 CRITICAL MANDATES. EXECUTE THEM SEQUENTIALLY:
+
+        1. ANSWER-QUESTION ALIGNMENT:
+           - Verify that every 'answer' textually and logically matches its 'question'.
+           - If an answer is off-topic, generic, or mismatched, YOU MUST RETURN TO THE PDF SOURCE, find the correct information, and overwrite the bad data.
+
+        2. ZERO BLANKS POLICY:
+           - NO FIELD MAY REMAIN EMPTY.
+           - If an answer is "", null, "unknown", or missing, SEARCH THE PDF EXHAUSTIVELY.
+           - If found: Extract it.
+           - If TRULY not found after deep search: Use "Not described".
+           - DO NOT ALLOW BLANKS.
+
+        3. CONSTANT REFERENCE COMPLIANCE:
+           - Check the 'SCHEMA BLOCK' for 'options' and 'type'.
+           - Your output 'answer' MUST EXACTLY MATCH one of the provided options if defined.
+           - If the PDF says "GSK" but option is "GlaxoSmithKline", map it accurately.
+           - If format is "18 C", fix it to match schema (e.g., "18 months").
+
+        4. STRICT ORDER INTEGRITY:
+           - Your output JSON array must EXACTLY match the order of questions in the 'SCHEMA BLOCK'.
+           - Do not sort, do not shuffle, do not omit keys.
+
+        5. AUDIT COMPLETION GATE (INTERNAL CHECKLIST):
+           Before outputting JSON, ask yourself:
+           - All questions present? [ ]
+           - No blanks? [ ]
+           - Order matches Schema? [ ]
+           - Answers meaningful? [ ]
+           - Constants respected? [ ]
+           
+           IF ANY CHECK FAILS, RE-PROCESS THAT ITEM USING THE PDF BEFORE FINALIZING.
+
         OUTPUT FORMAT: Return a valid JSON array matching the schema.
-        DATA: ${JSON.stringify(itemsByBlock[blockId], null, 2)}`;
+        SCHEMA BLOCK: ${JSON.stringify(block, null, 2)}
+        CURRENT DATA: ${JSON.stringify(blockItems, null, 2)}`;
 
         // Agent 2 uses Flash as requested
         const response = await generateContentWithRetry(ai, MODEL_FLASH, {
             contents: { parts: [filePart, { text: prompt }] },
-            config: { responseMimeType: "application/json", responseSchema: AUDIT_SCHEMA, thinkingConfig: { thinkingBudget: 4096 } }
+            config: { 
+              responseMimeType: "application/json", 
+              responseSchema: AUDIT_SCHEMA, 
+              thinkingConfig: { thinkingBudget: 4096 },
+              maxOutputTokens: 30000 
+            }
         });
         
         // Use safeJsonParse to ensure robustness
@@ -320,7 +493,7 @@ export const runAuditAgent = async (
         totalUsage.outputTokens += usage.outputTokens;
         totalUsage.totalTokens += usage.totalTokens;
 
-        onProgress(i + 1, blockIds.length);
+        onProgress(i + 1, blocks.length);
     }
     return { items: auditedItems, usage: totalUsage };
   };
@@ -346,16 +519,25 @@ export const runQAAgent = async (
 
     for (let i = 0; i < blocks.length; i++) {
         const block = blocks[i];
-        const prompt = `FINAL QA AUTHORITY. File: ${file.name}. Ensure order and accuracy for Block ${block.block_number}.
-        Check for any logical inconsistencies.
-        OUTPUT FORMAT: Return a valid JSON array matching the schema.
+        const prompt = `FINAL QA AUTHORITY. File: ${file.name}. Block ${block.block_number}.
+        
+        MANDATE:
+        1. CSV INTEGRITY & ORDER: The output JSON MUST contain an entry for EVERY question in the 'SCHEMA BLOCK', in the EXACT ORDER defined there.
+        2. NO MISSING FIELDS: Verify every single question has a non-empty answer. If still missing, fill with "Not described".
+        3. FINAL VALIDATION: Ensure the list structure matches the schema 1:1. This is critical for CSV column alignment.
+
         SCHEMA BLOCK: ${JSON.stringify(block, null, 2)}
         AUDITED DATA: ${JSON.stringify(auditedByBlock[block.block_number] || [], null, 2)}`;
 
         // Agent 3 uses Flash for efficiency/speed in final QA
         const response = await generateContentWithRetry(ai, MODEL_FLASH, {
             contents: { parts: [filePart, { text: prompt }] },
-            config: { responseMimeType: "application/json", responseSchema: QA_SCHEMA, thinkingConfig: { thinkingBudget: 8192 } }
+            config: { 
+              responseMimeType: "application/json", 
+              responseSchema: QA_SCHEMA, 
+              thinkingConfig: { thinkingBudget: 8192 },
+              maxOutputTokens: 30000 
+            }
         });
         
         // Use safeJsonParse to ensure robustness
@@ -370,4 +552,67 @@ export const runQAAgent = async (
         onProgress(i + 1, blocks.length);
     }
     return { items: finalQAItems, usage: totalUsage };
+};
+
+export const runExportValidationAgent = async (
+  file: File,
+  qaData: AuditItem[],
+  schemaDef: SchemaDef,
+  onProgress: (current: number, total: number) => void
+): Promise<{items: AuditItem[], usage: TokenUsage}> => {
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
+  // We typically don't need the PDF for structural validation of the JSON, but we pass it if needed. 
+  // For safety, we can pass it if the agent decides to look up something, but primarily this is a Logic/Structural check.
+  // We'll pass it to keep the interface consistent.
+  const filePart = await fileToPart(file);
+  const blocks = schemaDef.blocks;
+  const validatedItems: AuditItem[] = [];
+  let totalUsage: TokenUsage = { promptTokens: 0, outputTokens: 0, totalTokens: 0 };
+
+  const dataByBlock = qaData.reduce((acc, item) => {
+      const bid = item.block_id || 0;
+      if (!acc[bid]) acc[bid] = [];
+      acc[bid].push(item);
+      return acc;
+  }, {} as Record<number, AuditItem[]>);
+
+  for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      const prompt = `EXPORT VALIDATION AGENT. File: ${file.name}. Block ${block.block_number}.
+      
+      CRITICAL OBJECTIVE: Guarantee 100% integrity for the Excel export.
+      
+      RESPONSIBILITIES:
+      1. 1:1 MAPPING CHECK: Verify each question key/ID maps to the correct Schema Question.
+      2. ORDER PRESERVATION: Confirm the output preserves the EXACT original question order from the Schema.
+      3. COMPLETENESS: Confirm NO BLANKS exist. If an answer is missing, fill it with "Not described" or extract if possible.
+      4. EXACT MATCH ASSERTION: The values must match the input audited values unless correcting a structure/blank error.
+
+      EXPORT VALIDATION GATE:
+      If any mismatch is detected, you MUST fix it in your output.
+      
+      SCHEMA BLOCK: ${JSON.stringify(block, null, 2)}
+      CANDIDATE DATA: ${JSON.stringify(dataByBlock[block.block_number] || [], null, 2)}`;
+
+      const response = await generateContentWithRetry(ai, MODEL_FLASH, {
+          contents: { parts: [filePart, { text: prompt }] },
+          config: { 
+            responseMimeType: "application/json", 
+            responseSchema: QA_SCHEMA, // Reuse QA schema as it matches structure
+            thinkingConfig: { thinkingBudget: 4096 },
+            maxOutputTokens: 30000 
+          }
+      });
+      
+      const result = safeJsonParse<AuditItem[]>(response.text, []);
+      validatedItems.push(...result);
+
+      const usage = mapUsage(response);
+      totalUsage.promptTokens += usage.promptTokens;
+      totalUsage.outputTokens += usage.outputTokens;
+      totalUsage.totalTokens += usage.totalTokens;
+
+      onProgress(i + 1, blocks.length);
+  }
+  return { items: validatedItems, usage: totalUsage };
 };

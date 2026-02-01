@@ -1,28 +1,31 @@
 
+export interface QuestionDef {
+  key: string;
+  label: string;
+  type: string;
+  options?: string[];
+  default?: string;
+  locked?: boolean;
+  instruction?: string;
+}
+
 export interface SectionDef {
   section_name: string;
-  question: string;
-  instructions: string;
-  expected_answer_type: string;
-  allowed_values?: string[];
-  allowed_values_examples?: string[];
-  fixed_value?: string;
+  questions: QuestionDef[];
 }
 
 export interface BlockDef {
   block_number: number;
   block_name: string;
-  description: string;
   sections: SectionDef[];
+  description?: string;
+  notes?: string;
 }
 
 export interface SchemaDef {
-  global_instructions: {
-    general: string;
-    extraction: string;
-  };
+  table_name?: string;
+  language?: string;
   blocks: BlockDef[];
-  final_validation_requirement: string;
 }
 
 export interface ExtractionItem {
@@ -56,7 +59,7 @@ export interface FileResult {
   logs: LogEntry[];
   supervisorIsolationCheck?: string;
   tokenUsage: TokenUsage;
-  completedAt?: string; // New field for history
+  completedAt?: string;
 }
 
 export interface User {
@@ -67,7 +70,7 @@ export interface User {
 }
 
 export type ProcessStatus = 'idle' | 'batch_processing' | 'complete' | 'error';
-export type AgentStep = 'supervisor_pre' | 'extracting' | 'auditing' | 'qa' | 'supervisor_post';
+export type AgentStep = 'supervisor_pre' | 'extracting' | 'auditing' | 'qa' | 'supervisor_post' | 'export_validation';
 
 export interface LogEntry {
   timestamp: string;

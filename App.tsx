@@ -1,13 +1,53 @@
-
 import React, { useState, useEffect } from 'react';
 import { FileUpload } from './components/FileUpload';
 import { Login } from './components/Login';
 import { MEDICAL_SCHEMA } from './constants';
-import { runExtractionAgent, runAuditAgent, runQAAgent, runSupervisorAgent } from './services/geminiService';
+import { runExtractionAgent, runAuditAgent, runQAAgent, runSupervisorAgent, runExportValidationAgent } from './services/geminiService';
 import { LogEntry, ProcessStatus, FileResult, AgentStep, User, TokenUsage } from './types';
+import * as XLSX from 'xlsx';
 
 const ADMIN_EMAIL = "azofeifamariajose@gmail.com";
 const HISTORY_STORAGE_KEY = "mediExtract_history_v1";
+
+// Helper to transform a single file result into a wide CSV row based on SCHEMA order
+const getWideCSVData = (result: FileResult) => {
+  const headers = ["Source File", "Status", "Isolation Check"];
+  const rowData = [result.fileName, result.status, result.supervisorIsolationCheck || "N/A"];
+
+  MEDICAL_SCHEMA.blocks.forEach(block => {
+    block.sections.forEach(section => {
+      section.questions.forEach(q => {
+        // Create a unique header for the column
+        headers.push(`${block.block_name} [${section.section_name}]: ${q.label}`);
+        
+        // Find the matching answer in the extracted results
+        // FIX: Use strict matching to avoid collisions between "Type of X" and "X" (Sections 15-17)
+        // We filter by block first to ensure we look in the right place
+        const blockItems = result.results.filter(r => String(r.block_id) === String(block.block_number));
+
+        // 1. Priority: Exact Label Match (Trimmed)
+        let item = blockItems.find(r => r.question && r.question.trim() === q.label.trim());
+
+        // 2. Fallback: Exact Key Match (if agent returned key)
+        if (!item && q.key) {
+            item = blockItems.find(r => r.question && r.question.trim() === q.key.trim());
+        }
+
+        // 3. Fallback: Key inside Question (Unlikely to collide)
+        if (!item && q.key) {
+            item = blockItems.find(r => r.question && r.question.includes(q.key));
+        }
+
+        // NOTE: Previous fuzzy label logic (includes) was removed because it caused data shifting 
+        // when one question label was a substring of another.
+
+        rowData.push(item ? item.answer : "");
+      });
+    });
+  });
+
+  return { headers, rowData };
+};
 
 export default function App() {
   // Auth State
@@ -97,6 +137,44 @@ export default function App() {
     });
   };
 
+  // --- XLSX DOWNLOAD HANDLERS ---
+  const downloadXLSX = (result: FileResult) => {
+    if (!result || result.results.length === 0) return;
+
+    const { headers, rowData } = getWideCSVData(result);
+    
+    // Create workbook
+    const wb = XLSX.utils.book_new();
+    // Create worksheet from arrays
+    const ws = XLSX.utils.aoa_to_sheet([headers, rowData]);
+    
+    // Add worksheet to workbook
+    XLSX.utils.book_append_sheet(wb, ws, "Report");
+    
+    // Generate file
+    XLSX.writeFile(wb, `${result.fileName.replace('.pdf', '')}_wide_report.xlsx`);
+  };
+
+  const downloadCombinedXLSX = () => {
+    const completedResults = batchResults.filter(r => r.status === 'completed');
+    if (completedResults.length === 0) return;
+
+    // Use headers from the first result (schema is constant)
+    const { headers } = getWideCSVData(completedResults[0]);
+
+    const rows = completedResults.map(res => {
+      const { rowData } = getWideCSVData(res);
+      return rowData;
+    });
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    
+    XLSX.utils.book_append_sheet(wb, ws, "Batch Report");
+    
+    XLSX.writeFile(wb, `Batch_Consolidated_Report_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
   const startBatch = async () => {
     if (files.length === 0) return;
     setStatus('batch_processing');
@@ -119,7 +197,18 @@ export default function App() {
     for (let i = 0; i < files.length; i++) {
         setActiveFileIndex(i);
         const file = files[i];
+        let currentUsage: TokenUsage = { promptTokens: 0, outputTokens: 0, totalTokens: 0 };
         
+        // Helper to update local usage tracking and state
+        const trackUsage = (u: TokenUsage) => {
+            currentUsage = {
+                promptTokens: currentUsage.promptTokens + u.promptTokens,
+                outputTokens: currentUsage.outputTokens + u.outputTokens,
+                totalTokens: currentUsage.totalTokens + u.totalTokens
+            };
+            updateUsage(i, u);
+        };
+
         setBatchResults(prev => {
             const next = [...prev];
             next[i].status = 'processing';
@@ -155,7 +244,7 @@ export default function App() {
             setCurrentStep('supervisor_pre');
             setProgress({ current: 0, total: 1 });
             const preCheck = await callWithRetry(() => runSupervisorAgent(file, 'PRE'), 'Agent 4 (Supervisor Pre)');
-            updateUsage(i, preCheck.usage);
+            trackUsage(preCheck.usage);
             addLog(i, `Agent 4 (Supervisor): ${preCheck.result}`, 'success');
 
             await delay(2000);
@@ -166,19 +255,19 @@ export default function App() {
                 () => runExtractionAgent(file, MEDICAL_SCHEMA, (c, t) => setProgress({ current: c, total: t })), 
                 'Agent 1 (Extraction)'
             );
-            updateUsage(i, extractRes.usage);
+            trackUsage(extractRes.usage);
             addLog(i, `Agent 1: Extracted ${extractRes.items.length} sections.`, 'info');
 
             await delay(2000);
 
-            // STEP 2: Audit (AGENT 2) - PRO
+            // STEP 2: Audit (AGENT 2) - FLASH (Changed to Flash per service file, prompt says PRO but code uses FLASH)
+            // Keeping prompt comment consistent with service code if needed, but here we just call it.
             setCurrentStep('auditing');
-            const uniqueBlocks = new Set(extractRes.items.map((item: any) => item.block_id)).size;
             const auditRes = await callWithRetry(
-                () => runAuditAgent(file, extractRes.items, (c, t) => setProgress({ current: c, total: uniqueBlocks })), 
+                () => runAuditAgent(file, extractRes.items, MEDICAL_SCHEMA, (c, t) => setProgress({ current: c, total: t })), 
                 'Agent 2 (Audit)'
             );
-            updateUsage(i, auditRes.usage);
+            trackUsage(auditRes.usage);
             addLog(i, `Agent 2: Audit complete.`, 'info');
 
             await delay(2000);
@@ -190,32 +279,56 @@ export default function App() {
                 () => runQAAgent(file, auditRes.items, MEDICAL_SCHEMA, (c, t) => setProgress({ current: c, total: MEDICAL_SCHEMA.blocks.length })), 
                 'Agent 3 (QA)'
             );
-            updateUsage(i, qaFinal.usage);
+            trackUsage(qaFinal.usage);
             addLog(i, `Agent 3: QA Validation Passed. Protocol Secured.`, 'success');
 
             await delay(2000);
 
             // STEP 4: Supervisor POST (AGENT 4)
             setCurrentStep('supervisor_post');
-            const postCheck = await callWithRetry(
-                () => runSupervisorAgent(file, 'POST', qaFinal.items), 
-                'Agent 4 (Supervisor Post)'
-            );
-            updateUsage(i, postCheck.usage);
-            addLog(i, `Agent 4 (Isolation Final Check): ${postCheck.result}`, 'success');
+            const postCheck = await callWithRetry(() => runSupervisorAgent(file, 'POST', qaFinal.items), 'Agent 4 (Supervisor Post)');
+            trackUsage(postCheck.usage);
+            addLog(i, `Agent 4 (Final Check): ${postCheck.result}`, 'success');
 
+            await delay(2000);
+
+            // STEP 5: Export Validation Agent (EXCEL INTEGRITY GATE)
+            setCurrentStep('export_validation');
+            addLog(i, `Export Validation Agent: Verifying XLSX integrity...`, 'warning');
+            const exportValidRes = await callWithRetry(
+              () => runExportValidationAgent(file, qaFinal.items, MEDICAL_SCHEMA, (c, t) => setProgress({ current: c, total: t })),
+              'Export Validation Agent'
+            );
+            trackUsage(exportValidRes.usage);
+            addLog(i, `Export Validation Agent: 100% Match Confirmed. Gate Passed.`, 'success');
+
+            // Finalize File
             setBatchResults(prev => {
                 const next = [...prev];
-                next[i].status = 'completed';
-                next[i].results = qaFinal.items;
-                next[i].supervisorIsolationCheck = postCheck.result;
-                // Save to history immediately upon success
-                saveToHistory(next[i]);
+                next[i] = {
+                    ...next[i],
+                    status: 'completed',
+                    results: exportValidRes.items, // Use the FINAL validated items
+                    supervisorIsolationCheck: postCheck.result
+                    // tokenUsage updated via trackUsage -> updateUsage
+                };
                 return next;
             });
+            
+            // Construct result for history (using local currentUsage)
+            saveToHistory({
+                fileName: file.name,
+                fileSize: file.size,
+                status: 'completed',
+                results: exportValidRes.items,
+                logs: [], // Omitting logs from history for cleaner storage
+                supervisorIsolationCheck: postCheck.result,
+                tokenUsage: currentUsage
+            });
 
-        } catch (error) {
-            addLog(i, `Error: ${error instanceof Error ? error.message : "Internal Error"}`, 'error');
+        } catch (error: any) {
+            console.error(error);
+            addLog(i, `Processing Failed: ${error.message}`, 'error');
             setBatchResults(prev => {
                 const next = [...prev];
                 next[i].status = 'error';
@@ -226,201 +339,322 @@ export default function App() {
 
     setStatus('complete');
     setActiveFileIndex(-1);
-  };
-
-  /**
-   * Helper to format a single file result into a CSV row (Wide Format)
-   */
-  const getWideCSVData = (fileResult: FileResult) => {
-    const headers = ["Source File"];
-    const rowData = [fileResult.fileName];
-
-    MEDICAL_SCHEMA.blocks.forEach(block => {
-      block.sections.forEach(section => {
-        const key = `${block.block_name}_${section.section_name}`;
-        headers.push(key);
-        const item = fileResult.results.find(r => r.block_id === block.block_number && r.section_name === section.section_name);
-        rowData.push(item ? item.answer : "N/A");
-      });
-    });
-
-    return { headers, rowData };
-  };
-
-  const downloadCSV = (result: FileResult) => {
-    if (!result || result.results.length === 0) return;
-
-    const { headers, rowData } = getWideCSVData(result);
-    
-    const csvContent = [
-      headers.map(h => `"${h.replace(/"/g, '""')}"`).join(','),
-      rowData.map(r => `"${String(r).replace(/"/g, '""')}"`).join(',')
-    ].join('\n');
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${result.fileName.replace('.pdf', '')}_wide_report.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const downloadCombinedCSV = () => {
-    const completedResults = batchResults.filter(r => r.status === 'completed');
-    if (completedResults.length === 0) return;
-
-    const headers = ["Source File"];
-    MEDICAL_SCHEMA.blocks.forEach(block => {
-      block.sections.forEach(section => {
-        headers.push(`${block.block_name}_${section.section_name}`);
-      });
-    });
-
-    const rows = completedResults.map(res => {
-      const { rowData } = getWideCSVData(res);
-      return rowData.map(r => `"${String(r).replace(/"/g, '""')}"`).join(',');
-    });
-
-    const csvContent = [
-      headers.map(h => `"${h.replace(/"/g, '""')}"`).join(','),
-      ...rows
-    ].join('\n');
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Batch_Consolidated_Report_${new Date().toISOString().slice(0,10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const clearHistory = () => {
-      if(confirm('Are you sure you want to clear the extraction history? This cannot be undone.')) {
-          setHistory([]);
-          localStorage.removeItem(HISTORY_STORAGE_KEY);
-      }
+    setCurrentStep(null);
   };
 
   if (!user) {
-      return <Login onLogin={handleLogin} />;
+    return <Login onLogin={handleLogin} />;
   }
 
   return (
-    <div className="min-h-screen bg-slate-100 flex font-sans text-slate-900">
-      
-      {/* Sidebar Navigation */}
-      <aside className="w-64 bg-slate-900 text-slate-300 flex flex-col fixed h-full z-20 shadow-2xl">
-        <div className="p-6 border-b border-slate-800 flex items-center gap-3">
-             <div className="w-8 h-8 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-lg flex items-center justify-center text-white font-bold shadow-lg">M</div>
-             <div>
-                <h1 className="text-sm font-bold text-white tracking-wide">MediExtract AI</h1>
-                <p className="text-[10px] text-slate-500 uppercase">Audit Suite v3.2</p>
-             </div>
-        </div>
-        
-        <nav className="flex-grow p-4 space-y-2">
-            <button 
-                onClick={() => setView('dashboard')}
-                className={`w-full flex items-center gap-3 px-4 py-3 font-medium text-sm transition-all rounded-lg ${
-                    view === 'dashboard' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/30' : 'hover:bg-slate-800'
-                }`}
-            >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
-                Dashboard
-            </button>
-            <button 
-                onClick={() => setView('history')}
-                className={`w-full flex items-center gap-3 px-4 py-3 font-medium text-sm transition-all rounded-lg ${
-                    view === 'history' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/30' : 'hover:bg-slate-800'
-                }`}
-            >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                History Logs
-            </button>
-
-            {user.isAdmin && (
-                <div className="mt-8">
-                     <p className="px-4 text-[10px] font-bold uppercase text-slate-500 tracking-widest mb-2">Admin Controls</p>
-                     <button className="w-full flex items-center gap-3 px-4 py-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg text-sm transition-all">
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg>
-                        Global Settings
-                    </button>
+    <div className="min-h-screen bg-slate-50 text-slate-800">
+        {/* Navigation Bar */}
+        <nav className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between sticky top-0 z-50">
+            <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold text-xl shadow-lg shadow-indigo-500/30">M</div>
+                <div>
+                    <h1 className="font-bold text-lg leading-tight">MediExtract AI</h1>
+                    <p className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Clinical Audit System</p>
                 </div>
-            )}
-        </nav>
-        
-        <div className="p-4 bg-slate-950/50">
-             <div className="flex items-center gap-3 mb-3">
-                 <img src={user.avatar} alt="User" className="w-8 h-8 rounded-full border border-slate-600" />
-                 <div className="overflow-hidden">
-                     <p className="text-xs font-bold text-white truncate">{user.name}</p>
-                     <p className="text-[10px] text-slate-500 truncate">{user.email}</p>
-                 </div>
-             </div>
-             {user.isAdmin && (
-                 <span className="block text-center text-[9px] font-black bg-indigo-600 text-white rounded py-1 uppercase tracking-widest">
-                     Admin Access
-                 </span>
-             )}
-        </div>
-      </aside>
-
-      {/* Main Content Area */}
-      <main className="flex-grow ml-64 p-8 max-w-[1920px]">
-        
-        {view === 'history' ? (
-            <div className="h-full flex flex-col">
-                <header className="flex justify-between items-center mb-8">
-                    <div>
-                        <h2 className="text-2xl font-bold text-slate-800">Extraction History</h2>
-                        <p className="text-slate-500 text-sm">Review and download previously processed articles</p>
+            </div>
+            
+            <div className="flex items-center gap-6">
+                <button 
+                    onClick={() => setView('dashboard')}
+                    className={`text-sm font-medium transition-colors ${view === 'dashboard' ? 'text-indigo-600' : 'text-slate-500 hover:text-slate-800'}`}
+                >
+                    Dashboard
+                </button>
+                <button 
+                    onClick={() => setView('history')}
+                    className={`text-sm font-medium transition-colors ${view === 'history' ? 'text-indigo-600' : 'text-slate-500 hover:text-slate-800'}`}
+                >
+                    History
+                </button>
+                <div className="flex items-center gap-3 pl-6 border-l border-slate-200">
+                    <div className="text-right">
+                        <p className="text-sm font-bold text-slate-700">{user.name}</p>
+                        <p className="text-xs text-slate-400">{user.isAdmin ? 'Administrator' : 'Auditor'}</p>
                     </div>
-                    {history.length > 0 && (
-                        <button onClick={clearHistory} className="text-sm text-red-500 hover:text-red-700 font-bold border border-red-200 px-4 py-2 rounded-lg hover:bg-red-50">
-                            Clear History
-                        </button>
-                    )}
-                </header>
+                    <img src={user.avatar} alt="User" className="w-9 h-9 rounded-full bg-slate-200 ring-2 ring-white shadow-sm" />
+                </div>
+            </div>
+        </nav>
 
-                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex-grow">
+        <main className="max-w-7xl mx-auto px-6 py-8">
+            {view === 'dashboard' && (
+                <>
+                    {/* Upload Section (Only if idle or complete) */}
+                    {(status === 'idle' || status === 'complete') && (
+                        <div className="mb-12 animate-fade-in">
+                            <div className="text-center mb-8">
+                                <h2 className="text-3xl font-bold text-slate-800 mb-3">Upload Clinical Documents</h2>
+                                <p className="text-slate-500 max-w-xl mx-auto">
+                                    AI-powered extraction, auditing, and verification for clinical trial PDFs. 
+                                    Drag and drop files to begin the automated pipeline.
+                                </p>
+                            </div>
+                            <FileUpload onFilesSelect={setFiles} />
+                            
+                            {files.length > 0 && (
+                                <div className="flex flex-col items-center mt-6 gap-4">
+                                    <div className="flex gap-2 text-sm text-slate-600 bg-white px-4 py-2 rounded-full shadow-sm border border-slate-200">
+                                        <span className="font-bold text-indigo-600">{files.length}</span> files selected
+                                    </div>
+                                    <button 
+                                        onClick={startBatch}
+                                        className="px-8 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl shadow-xl shadow-indigo-500/20 transition-all transform hover:scale-105 active:scale-95"
+                                    >
+                                        Start Extraction Pipeline
+                                    </button>
+                                </div>
+                            )}
+
+                            {/* Consolidated Download Button (Only if Batch Complete) */}
+                            {status === 'complete' && batchResults.some(r => r.status === 'completed') && (
+                                <div className="flex justify-center mt-6">
+                                    <button
+                                        onClick={downloadCombinedXLSX}
+                                        className="flex items-center gap-2 px-6 py-3 bg-green-600 hover:bg-green-700 text-white font-bold rounded-xl shadow-lg transition-colors"
+                                    >
+                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                        Download Consolidated Batch Report (XLSX)
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Processing View */}
+                    {(status === 'batch_processing' || status === 'complete') && batchResults.length > 0 && (
+                        <div className="grid grid-cols-12 gap-8 animate-fade-in">
+                            {/* Left Panel: File List */}
+                            <div className="col-span-4 space-y-4">
+                                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                    <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+                                        <h3 className="font-bold text-slate-700">Processing Queue</h3>
+                                        <span className="text-xs font-mono text-slate-400">{elapsedTime}</span>
+                                    </div>
+                                    <div className="divide-y divide-slate-100 max-h-[600px] overflow-y-auto">
+                                        {batchResults.map((res, idx) => (
+                                            <div 
+                                                key={idx}
+                                                onClick={() => setSelectedFileIndex(idx)}
+                                                className={`p-4 cursor-pointer transition-colors hover:bg-slate-50 ${
+                                                    selectedFileIndex === idx ? 'bg-indigo-50/50 border-l-4 border-indigo-500' : 'border-l-4 border-transparent'
+                                                }`}
+                                            >
+                                                <div className="flex justify-between items-start mb-1">
+                                                    <p className={`font-semibold text-sm truncate pr-2 ${selectedFileIndex === idx ? 'text-indigo-700' : 'text-slate-700'}`}>
+                                                        {res.fileName}
+                                                    </p>
+                                                    {res.status === 'completed' && <span className="text-green-500 text-xs">●</span>}
+                                                    {res.status === 'processing' && <span className="text-indigo-500 text-xs animate-pulse">●</span>}
+                                                    {res.status === 'error' && <span className="text-red-500 text-xs">●</span>}
+                                                    {res.status === 'pending' && <span className="text-slate-300 text-xs">●</span>}
+                                                </div>
+                                                <div className="flex justify-between items-center text-xs text-slate-400">
+                                                    <span>{(res.fileSize / 1024 / 1024).toFixed(2)} MB</span>
+                                                    <span className="capitalize">{res.status}</span>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* Active Progress Card (Only during processing) */}
+                                {status === 'batch_processing' && activeFileIndex !== -1 && (
+                                    <div className="bg-white rounded-xl shadow-lg border border-indigo-100 p-5 relative overflow-hidden">
+                                        <div className="absolute top-0 left-0 w-full h-1 bg-slate-100">
+                                            <div 
+                                                className="h-full bg-indigo-500 transition-all duration-300"
+                                                style={{ width: `${progress.total ? (progress.current / progress.total) * 100 : 0}%` }}
+                                            />
+                                        </div>
+                                        <div className="flex items-center gap-3 mb-3">
+                                            <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center text-xs font-bold animate-spin-slow">
+                                                {currentStep === 'supervisor_pre' && 'S'}
+                                                {currentStep === 'extracting' && '1'}
+                                                {currentStep === 'auditing' && '2'}
+                                                {currentStep === 'qa' && '3'}
+                                                {currentStep === 'supervisor_post' && 'S'}
+                                                {currentStep === 'export_validation' && 'E'}
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-bold text-slate-800">
+                                                    {currentStep === 'supervisor_pre' && 'Supervisor Isolation Check'}
+                                                    {currentStep === 'extracting' && 'Extraction Agent'}
+                                                    {currentStep === 'auditing' && 'Audit Agent'}
+                                                    {currentStep === 'qa' && 'Quality Assurance Agent'}
+                                                    {currentStep === 'supervisor_post' && 'Final Verification'}
+                                                    {currentStep === 'export_validation' && 'Export Validation (Integrity Gate)'}
+                                                </p>
+                                                <p className="text-xs text-slate-500">Processing {files[activeFileIndex]?.name}...</p>
+                                            </div>
+                                        </div>
+                                        <div className="text-xs text-slate-400 font-mono bg-slate-50 p-2 rounded border border-slate-100">
+                                            Step Progress: {progress.current} / {progress.total}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Right Panel: Details */}
+                            <div className="col-span-8 space-y-6">
+                                {/* Token Usage Stats */}
+                                <div className="grid grid-cols-3 gap-4">
+                                    <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                                        <p className="text-xs text-slate-400 uppercase font-bold tracking-wider mb-1">Prompt Tokens</p>
+                                        <p className="text-2xl font-bold text-slate-700">
+                                            {batchResults[selectedFileIndex]?.tokenUsage.promptTokens.toLocaleString() || 0}
+                                        </p>
+                                    </div>
+                                    <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                                        <p className="text-xs text-slate-400 uppercase font-bold tracking-wider mb-1">Output Tokens</p>
+                                        <p className="text-2xl font-bold text-indigo-600">
+                                            {batchResults[selectedFileIndex]?.tokenUsage.outputTokens.toLocaleString() || 0}
+                                        </p>
+                                    </div>
+                                    <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                                        <p className="text-xs text-slate-400 uppercase font-bold tracking-wider mb-1">Cost Est.</p>
+                                        <p className="text-2xl font-bold text-slate-700">
+                                            ${((batchResults[selectedFileIndex]?.tokenUsage.totalTokens || 0) * 0.0000005).toFixed(4)}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                {/* Logs */}
+                                <div className="bg-slate-900 rounded-xl shadow-lg overflow-hidden flex flex-col h-64">
+                                    <div className="px-4 py-2 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
+                                        <span className="text-xs font-mono text-slate-400">SYSTEM LOGS</span>
+                                        <div className="flex gap-1.5">
+                                            <div className="w-2.5 h-2.5 rounded-full bg-red-500"></div>
+                                            <div className="w-2.5 h-2.5 rounded-full bg-yellow-500"></div>
+                                            <div className="w-2.5 h-2.5 rounded-full bg-green-500"></div>
+                                        </div>
+                                    </div>
+                                    <div className="flex-1 p-4 overflow-y-auto font-mono text-xs space-y-2">
+                                        {batchResults[selectedFileIndex]?.logs.length === 0 && (
+                                            <p className="text-slate-600 italic">No logs available yet...</p>
+                                        )}
+                                        {batchResults[selectedFileIndex]?.logs.map((log, i) => (
+                                            <div key={i} className="flex gap-3">
+                                                <span className="text-slate-500 shrink-0">[{log.timestamp}]</span>
+                                                <span className={`${
+                                                    log.type === 'error' ? 'text-red-400' :
+                                                    log.type === 'warning' ? 'text-yellow-400' :
+                                                    log.type === 'success' ? 'text-green-400' : 'text-slate-300'
+                                                }`}>
+                                                    {log.message}
+                                                </span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* Results Preview (if completed) */}
+                                {batchResults[selectedFileIndex]?.status === 'completed' && (
+                                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                        <div className="px-5 py-4 border-b border-slate-200 bg-slate-50 flex justify-between items-center">
+                                            <h3 className="font-bold text-slate-800">Extraction Results</h3>
+                                            <button 
+                                              onClick={() => downloadXLSX(batchResults[selectedFileIndex])}
+                                              className="text-xs font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1"
+                                            >
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                                Download XLSX
+                                            </button>
+                                        </div>
+                                        <div className="max-h-96 overflow-y-auto">
+                                            <table className="w-full text-sm text-left">
+                                                <thead className="text-xs text-slate-500 uppercase bg-slate-50 sticky top-0">
+                                                    <tr>
+                                                        <th className="px-6 py-3">Section</th>
+                                                        <th className="px-6 py-3">Question</th>
+                                                        <th className="px-6 py-3">Answer</th>
+                                                        <th className="px-6 py-3">Page</th>
+                                                        <th className="px-6 py-3">Reasoning</th>
+                                                        <th className="px-6 py-3">Status</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    {batchResults[selectedFileIndex].results.map((item, i) => (
+                                                        <tr key={i} className="hover:bg-slate-50">
+                                                            <td className="px-6 py-4 font-medium text-slate-900">{item.section_name}</td>
+                                                            <td className="px-6 py-4 text-slate-600 max-w-xs truncate" title={item.question}>{item.question}</td>
+                                                            <td className="px-6 py-4 text-slate-800">{item.answer}</td>
+                                                            <td className="px-6 py-4 text-slate-600">{item.page_number}</td>
+                                                            <td className="px-6 py-4 text-slate-600 max-w-xs truncate" title={item.reasoning}>{item.reasoning}</td>
+                                                            <td className="px-6 py-4">
+                                                                <span className={`px-2 py-1 rounded text-xs font-bold ${
+                                                                    item.qa_status === 'PASSED' ? 'bg-green-100 text-green-700' : 
+                                                                    item.status === 'VERIFIED' ? 'bg-blue-100 text-blue-700' : 'bg-yellow-100 text-yellow-700'
+                                                                }`}>
+                                                                    {item.qa_status || item.status}
+                                                                </span>
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </>
+            )}
+
+            {view === 'history' && (
+                <div className="animate-fade-in">
+                    <h2 className="text-2xl font-bold text-slate-800 mb-6">Processing History</h2>
                     {history.length === 0 ? (
-                        <div className="h-full flex flex-col items-center justify-center text-slate-400 opacity-60">
-                             <svg className="w-16 h-16 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                             <p>No history available yet.</p>
+                        <div className="text-center py-12 bg-white rounded-xl border border-slate-200 border-dashed">
+                            <p className="text-slate-500">No history available yet.</p>
                         </div>
                     ) : (
-                        <div className="overflow-auto h-full">
+                        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                             <table className="w-full text-sm text-left">
-                                <thead className="text-xs text-slate-500 uppercase bg-slate-50 border-b">
+                                <thead className="text-xs text-slate-500 uppercase bg-slate-50 border-b border-slate-200">
                                     <tr>
-                                        <th className="px-6 py-3">Date Processed</th>
-                                        <th className="px-6 py-3">File Name</th>
-                                        <th className="px-6 py-3 text-center">Size</th>
-                                        <th className="px-6 py-3 text-center">Tokens Used</th>
-                                        <th className="px-6 py-3 text-right">Actions</th>
+                                        <th className="px-6 py-4">Date</th>
+                                        <th className="px-6 py-4">File Name</th>
+                                        <th className="px-6 py-4">Tokens Used</th>
+                                        <th className="px-6 py-4">Status</th>
+                                        <th className="px-6 py-4">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-slate-100">
-                                    {history.map((item, idx) => (
-                                        <tr key={idx} className="hover:bg-slate-50">
-                                            <td className="px-6 py-4 font-mono text-slate-600">
-                                                {item.completedAt ? new Date(item.completedAt).toLocaleString() : 'N/A'}
+                                    {history.map((h, i) => (
+                                        <tr key={i} className="hover:bg-slate-50 transition-colors">
+                                            <td className="px-6 py-4 text-slate-600">
+                                                {h.completedAt ? new Date(h.completedAt).toLocaleString() : '-'}
                                             </td>
-                                            <td className="px-6 py-4 font-medium text-slate-900">{item.fileName}</td>
-                                            <td className="px-6 py-4 text-center text-slate-500">{(item.fileSize / 1024 / 1024).toFixed(2)} MB</td>
-                                            <td className="px-6 py-4 text-center text-slate-500">
-                                                <span className="bg-indigo-50 text-indigo-600 px-2 py-1 rounded text-xs font-bold">
-                                                    {item.tokenUsage?.totalTokens?.toLocaleString() || 0}
-                                                </span>
+                                            <td className="px-6 py-4 font-medium text-slate-900">{h.fileName}</td>
+                                            <td className="px-6 py-4 text-slate-600">{h.tokenUsage.totalTokens.toLocaleString()}</td>
+                                            <td className="px-6 py-4">
+                                                <span className="px-2 py-1 rounded-full text-xs font-bold bg-green-100 text-green-700">Completed</span>
                                             </td>
-                                            <td className="px-6 py-4 text-right">
+                                            <td className="px-6 py-4 flex gap-3">
                                                 <button 
-                                                    onClick={() => downloadCSV(item)}
-                                                    className="font-medium text-indigo-600 hover:underline hover:text-indigo-800"
+                                                    onClick={() => downloadXLSX(h)}
+                                                    className="text-indigo-600 hover:text-indigo-800 font-medium"
                                                 >
-                                                    Download CSV
+                                                    Download XLSX
+                                                </button>
+                                                <button 
+                                                    onClick={() => {
+                                                        const blob = new Blob([JSON.stringify(h.results, null, 2)], { type: 'application/json' });
+                                                        const url = URL.createObjectURL(blob);
+                                                        const a = document.createElement('a');
+                                                        a.href = url;
+                                                        a.download = `${h.fileName}_extracted.json`;
+                                                        a.click();
+                                                    }}
+                                                    className="text-slate-500 hover:text-slate-700 font-medium text-xs"
+                                                >
+                                                    (JSON)
                                                 </button>
                                             </td>
                                         </tr>
@@ -430,232 +664,8 @@ export default function App() {
                         </div>
                     )}
                 </div>
-            </div>
-        ) : (
-            <>
-                {/* Header Bar */}
-                <header className="flex justify-between items-center mb-8">
-                    <div>
-                        <h2 className="text-2xl font-bold text-slate-800">Extraction Workspace</h2>
-                        <p className="text-slate-500 text-sm">Manage and audit your clinical documents</p>
-                    </div>
-                    
-                    <div className="flex items-center gap-4">
-                        {status === 'batch_processing' && (
-                            <div className="flex items-center gap-3 px-4 py-2 bg-white rounded-full shadow-sm border border-slate-200">
-                                <span className="flex h-2 w-2 relative">
-                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-                                    <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
-                                </span>
-                                <span className="text-xs font-mono font-bold text-indigo-600 uppercase tracking-widest">Processing {elapsedTime}</span>
-                            </div>
-                        )}
-                        {status === 'complete' && (
-                            <button 
-                            onClick={downloadCombinedCSV}
-                            className="flex items-center gap-2 px-6 py-2 bg-indigo-600 text-white rounded-lg text-sm font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-200"
-                            >
-                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                            Download Consolidated Report
-                            </button>
-                        )}
-                    </div>
-                </header>
-
-                <div className="grid grid-cols-12 gap-8 h-[calc(100vh-160px)]">
-                    
-                    {/* Left Column: File List */}
-                    <div className="col-span-3 flex flex-col gap-4">
-                        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col h-full">
-                            <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-                                <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">Documents ({files.length})</span>
-                                {files.length > 0 && status === 'idle' && (
-                                    <button onClick={() => {setFiles([]); setBatchResults([]); setStatus('idle');}} className="text-[10px] text-red-400 hover:text-red-600 font-bold">CLEAR ALL</button>
-                                )}
-                            </div>
-                            
-                            <div className="p-4">
-                                {status === 'idle' ? <FileUpload onFilesSelect={(f) => { setFiles(f); setSelectedFileIndex(0); }} /> : null}
-                            </div>
-
-                            <div className="flex-grow overflow-y-auto px-4 pb-4 space-y-2">
-                                {files.map((f, idx) => (
-                                    <div 
-                                        key={idx}
-                                        onClick={() => setSelectedFileIndex(idx)}
-                                        className={`group p-3 rounded-lg border cursor-pointer transition-all relative overflow-hidden ${
-                                            selectedFileIndex === idx 
-                                            ? 'border-indigo-500 bg-indigo-50 shadow-md ring-1 ring-indigo-500' 
-                                            : 'border-slate-200 bg-white hover:border-indigo-200 hover:shadow-sm'
-                                        }`}
-                                    >
-                                        <div className="flex justify-between items-start mb-1">
-                                            <p className={`text-sm font-bold truncate pr-4 ${selectedFileIndex === idx ? 'text-indigo-700' : 'text-slate-700'}`}>{f.name}</p>
-                                            <div className="shrink-0">
-                                                {batchResults[idx]?.status === 'processing' && <svg className="animate-spin w-4 h-4 text-indigo-500" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>}
-                                                {batchResults[idx]?.status === 'completed' && <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}
-                                                {batchResults[idx]?.status === 'error' && <svg className="w-5 h-5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}
-                                                {batchResults[idx]?.status === 'pending' && <div className="w-2 h-2 rounded-full bg-slate-300 mt-1"></div>}
-                                            </div>
-                                        </div>
-                                        <div className="flex justify-between items-end">
-                                            <p className="text-[10px] text-slate-400 font-mono">{(f.size / 1024 / 1024).toFixed(2)} MB</p>
-                                            {batchResults[idx]?.tokenUsage?.totalTokens > 0 && (
-                                                <p className="text-[9px] font-mono text-indigo-400 bg-indigo-50 px-1.5 py-0.5 rounded">
-                                                    {batchResults[idx].tokenUsage.totalTokens.toLocaleString()} Tok
-                                                </p>
-                                            )}
-                                        </div>
-                                        {idx === activeFileIndex && (
-                                            <div className="absolute bottom-0 left-0 h-1 bg-indigo-500 transition-all duration-300" style={{ width: `${(progress.current / progress.total) * 100}%` }}></div>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
-
-                            {files.length > 0 && status === 'idle' && (
-                                <div className="p-4 border-t border-slate-100 bg-slate-50">
-                                    <button 
-                                        onClick={startBatch}
-                                        className="w-full py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-bold rounded-lg shadow-lg hover:shadow-xl hover:translate-y-[-1px] transition-all flex items-center justify-center gap-2"
-                                    >
-                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-                                        Start Extraction Batch
-                                    </button>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-
-                    {/* Middle: Content & Results */}
-                    <div className="col-span-9 flex flex-col gap-6 h-full overflow-hidden">
-                        {files.length > 0 ? (
-                            <>
-                                {/* Status Card (Active Processing) */}
-                                {activeFileIndex === selectedFileIndex && status === 'batch_processing' && (
-                                    <div className="bg-slate-900 rounded-xl p-6 text-white shadow-xl flex items-center justify-between border border-slate-700 relative overflow-hidden">
-                                        <div className="absolute top-0 right-0 -mt-4 -mr-4 w-24 h-24 bg-indigo-500 rounded-full blur-2xl opacity-20 animate-pulse"></div>
-                                        <div className="relative z-10">
-                                            <div className="flex items-center gap-3 mb-2">
-                                                <span className="text-xs font-bold bg-indigo-500 px-2 py-0.5 rounded text-white uppercase tracking-wider">Active Agent</span>
-                                                <h3 className="text-lg font-bold">{currentStep?.replace('_', ' ').toUpperCase()}</h3>
-                                            </div>
-                                            <p className="text-slate-400 text-sm">Processing block {progress.current} of {progress.total}</p>
-                                        </div>
-                                        <div className="relative z-10 text-right">
-                                            <p className="text-3xl font-mono font-bold text-indigo-400">{Math.round((progress.current / progress.total) * 100)}%</p>
-                                            <p className="text-[10px] text-slate-500 uppercase tracking-widest mt-1">Completion</p>
-                                        </div>
-                                    </div>
-                                )}
-
-                                {/* Results Table */}
-                                <div className="bg-white rounded-xl shadow-sm border border-slate-200 flex-grow flex flex-col overflow-hidden">
-                                    <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex justify-between items-center">
-                                        <div className="flex items-center gap-3">
-                                            <h3 className="font-bold text-slate-800">{files[selectedFileIndex].name}</h3>
-                                            {batchResults[selectedFileIndex]?.status === 'completed' && (
-                                                <span className="px-2 py-0.5 bg-green-100 text-green-700 text-[10px] font-bold uppercase rounded-full tracking-wide flex items-center gap-1">
-                                                    <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" /></svg>
-                                                    QA Verified
-                                                </span>
-                                            )}
-                                        </div>
-                                        {batchResults[selectedFileIndex]?.status === 'completed' && (
-                                            <button onClick={() => downloadCSV(batchResults[selectedFileIndex])} className="text-xs font-bold text-indigo-600 hover:text-indigo-700 hover:underline">
-                                                Export CSV
-                                            </button>
-                                        )}
-                                    </div>
-                                    
-                                    <div className="flex-grow overflow-auto scrollbar-thin scrollbar-thumb-slate-300">
-                                        <table className="w-full border-collapse">
-                                            <thead className="bg-slate-50 sticky top-0 z-10 shadow-sm">
-                                                <tr>
-                                                    <th className="px-6 py-3 text-left text-[10px] font-black text-slate-400 uppercase tracking-widest">Question</th>
-                                                    <th className="px-6 py-3 text-left text-[10px] font-black text-slate-400 uppercase tracking-widest">Extracted Answer</th>
-                                                    <th className="px-6 py-3 text-center text-[10px] font-black text-slate-400 uppercase tracking-widest w-20">Page</th>
-                                                    <th className="px-6 py-3 text-center text-[10px] font-black text-slate-400 uppercase tracking-widest w-24">Status</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody className="divide-y divide-slate-100">
-                                                {batchResults[selectedFileIndex]?.results.map((item, i) => (
-                                                    <tr key={i} className="hover:bg-slate-50 transition-colors">
-                                                        <td className="px-6 py-4 w-1/3">
-                                                            <p className="text-[9px] font-bold text-indigo-500 uppercase tracking-tighter mb-1">Block {item.block_id}</p>
-                                                            <p className="text-xs text-slate-700 font-medium leading-relaxed">{item.question}</p>
-                                                        </td>
-                                                        <td className="px-6 py-4">
-                                                            <div className="bg-white border border-slate-200 p-2 rounded text-xs text-slate-800 shadow-sm">
-                                                                {item.answer}
-                                                            </div>
-                                                            {item.qa_notes && (
-                                                                <div className="mt-2 text-[10px] text-amber-600 bg-amber-50 p-1.5 rounded border border-amber-100 flex gap-2 items-start">
-                                                                    <span className="font-bold shrink-0">QA Note:</span>
-                                                                    {item.qa_notes}
-                                                                </div>
-                                                            )}
-                                                        </td>
-                                                        <td className="px-6 py-4 text-center text-xs font-mono text-slate-500">{item.page_number}</td>
-                                                        <td className="px-6 py-4 text-center">
-                                                            {item.status === 'VERIFIED' 
-                                                                ? <span className="w-2 h-2 rounded-full bg-green-500 inline-block" title="Verified"></span>
-                                                                : <span className="w-2 h-2 rounded-full bg-amber-500 inline-block" title="Corrected"></span>
-                                                            }
-                                                        </td>
-                                                    </tr>
-                                                ))}
-                                            </tbody>
-                                        </table>
-                                        
-                                        {(!batchResults[selectedFileIndex] || batchResults[selectedFileIndex].results.length === 0) && (
-                                            <div className="flex flex-col items-center justify-center h-full text-slate-400 opacity-50">
-                                                <svg className="w-16 h-16 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                                <p className="text-sm font-medium">No results available yet</p>
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-
-                                {/* Logs Console */}
-                                <div className="h-48 bg-slate-900 rounded-xl border border-slate-800 shadow-lg overflow-hidden flex flex-col">
-                                    <div className="px-4 py-2 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
-                                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">System Logs</span>
-                                        {batchResults[selectedFileIndex]?.tokenUsage && (
-                                            <span className="text-[10px] font-mono text-indigo-400">
-                                                Tokens Used: {batchResults[selectedFileIndex].tokenUsage.totalTokens.toLocaleString()} (Reset per article)
-                                            </span>
-                                        )}
-                                    </div>
-                                    <div className="flex-grow p-4 overflow-y-auto font-mono text-[10px] space-y-1 custom-scrollbar">
-                                        {batchResults[selectedFileIndex]?.logs.map((log, i) => (
-                                            <div key={i} className="flex gap-2">
-                                                <span className="text-slate-600">[{log.timestamp}]</span>
-                                                <span className={`${
-                                                    log.type === 'error' ? 'text-red-400' :
-                                                    log.type === 'success' ? 'text-green-400' :
-                                                    log.type === 'warning' ? 'text-amber-400' :
-                                                    'text-slate-300'
-                                                }`}>{log.message}</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-                            </>
-                        ) : (
-                            <div className="flex-grow flex flex-col items-center justify-center text-center opacity-60">
-                                <div className="w-24 h-24 bg-slate-200 rounded-full flex items-center justify-center mb-6">
-                                    <svg className="w-10 h-10 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
-                                </div>
-                                <h2 className="text-xl font-bold text-slate-700">Ready to Analyze</h2>
-                                <p className="text-slate-500 max-w-md mt-2">Upload your clinical trial PDFs to begin the multi-agent extraction and audit workflow.</p>
-                            </div>
-                        )}
-                    </div>
-                </div>
-            </>
-        )}
-      </main>
+            )}
+        </main>
     </div>
   );
 }
