@@ -2,9 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { FileUpload } from './components/FileUpload';
 import { Login } from './components/Login';
 import { MEDICAL_SCHEMA } from './constants';
-import { runExtractionAgent, runAuditAgent, runQAAgent, runSupervisorAgent, runExportValidationAgent } from './services/geminiService';
-import { LogEntry, ProcessStatus, FileResult, AgentStep, User, TokenUsage } from './types';
+import { runExtractionAgent, runAuditAgent, runQAAgent, runSupervisorAgent } from './services/geminiService';
+import { generateExtractionReport } from './services/pdfService';
+import { LogEntry, ProcessStatus, FileResult, AgentStep, User, TokenUsage, AuditItem, SchemaDef } from './types';
 import * as XLSX from 'xlsx';
+import { validateAuditDataDeterministically } from './services/deterministicValidation';
 
 const ADMIN_EMAIL = "azofeifamariajose@gmail.com";
 const HISTORY_STORAGE_KEY = "mediExtract_history_v1";
@@ -48,6 +50,16 @@ const getWideCSVData = (result: FileResult) => {
 
   return { headers, rowData };
 };
+
+const mergeAuditedItems = (baseItems: AuditItem[], qaItems: AuditItem[]): AuditItem[] => {
+  const qaByKey = new Map(qaItems.map(item => [`${item.block_id}::${item.question.trim().toLowerCase()}`, item]));
+  return baseItems.map(item => qaByKey.get(`${item.block_id}::${item.question.trim().toLowerCase()}`) || item);
+};
+
+const buildSchemaSubset = (schema: SchemaDef, blockNumbers: number[]): SchemaDef => ({
+  ...schema,
+  blocks: schema.blocks.filter(block => blockNumbers.includes(block.block_number))
+});
 
 export default function App() {
   // Auth State
@@ -192,8 +204,6 @@ export default function App() {
     }));
     setBatchResults(initialBatch);
 
-    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
     for (let i = 0; i < files.length; i++) {
         setActiveFileIndex(i);
         const file = files[i];
@@ -228,9 +238,9 @@ export default function App() {
               const errorMessage = error.message || error.toString();
               if (errorMessage.includes('429') || errorMessage.includes('exhausted') || error.status === 429) {
                 attempts++;
-                const waitTime = Math.pow(2, attempts) * 1000; // 2s, 4s, 8s...
+                const waitTime = Math.pow(2, attempts - 1) * 750; // 0.75s, 1.5s, 3s...
                 addLog(i, `Quota exceeded in ${agentName}. Retrying in ${waitTime/1000}s...`, 'warning');
-                await delay(waitTime);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
               } else {
                 throw error; 
               }
@@ -247,7 +257,6 @@ export default function App() {
             trackUsage(preCheck.usage);
             addLog(i, `Agent 4 (Supervisor): ${preCheck.result}`, 'success');
 
-            await delay(2000);
 
             // STEP 1: Extraction (AGENT 1) - FLASH
             setCurrentStep('extracting');
@@ -258,7 +267,6 @@ export default function App() {
             trackUsage(extractRes.usage);
             addLog(i, `Agent 1: Extracted ${extractRes.items.length} sections.`, 'info');
 
-            await delay(2000);
 
             // STEP 2: Audit (AGENT 2) - FLASH (Changed to Flash per service file, prompt says PRO but code uses FLASH)
             // Keeping prompt comment consistent with service code if needed, but here we just call it.
@@ -270,37 +278,38 @@ export default function App() {
             trackUsage(auditRes.usage);
             addLog(i, `Agent 2: Audit complete.`, 'info');
 
-            await delay(2000);
 
-            // STEP 3: QA (AGENT 3) - FLASH (per request)
-            setCurrentStep('qa');
-            addLog(i, `Agent 3: Initiating Mandatory QA Protocol...`, 'warning');
-            const qaFinal = await callWithRetry(
-                () => runQAAgent(file, auditRes.items, MEDICAL_SCHEMA, (c, t) => setProgress({ current: c, total: MEDICAL_SCHEMA.blocks.length })), 
-                'Agent 3 (QA)'
-            );
-            trackUsage(qaFinal.usage);
-            addLog(i, `Agent 3: QA Validation Passed. Protocol Secured.`, 'success');
+            // STEP 3: Deterministic Validation (ORDER + COMPLETENESS + OPTIONS + DEFAULT FILL)
+            const deterministicCheck = validateAuditDataDeterministically(MEDICAL_SCHEMA, auditRes.items);
+            addLog(i, `Deterministic Validator: ${deterministicCheck.correctionCount} fixes across ${deterministicCheck.failedBlocks.length} blocks.`, deterministicCheck.correctionCount > 0 ? 'warning' : 'success');
 
-            await delay(2000);
+            // STEP 4: Conditional QA (only failed blocks)
+            let postQaItems: AuditItem[] = deterministicCheck.normalizedItems;
+            if (deterministicCheck.failedBlocks.length > 0) {
+              setCurrentStep('qa');
+              addLog(i, `Agent 3: QA for flagged blocks only (${deterministicCheck.failedBlocks.length}).`, 'warning');
+              const qaSchema = buildSchemaSubset(MEDICAL_SCHEMA, deterministicCheck.failedBlocks);
+              const qaRes = await callWithRetry(
+                () => runQAAgent(file, deterministicCheck.normalizedItems, qaSchema, (c, t) => setProgress({ current: c, total: t })),
+                'Agent 3 (Conditional QA)'
+              );
+              trackUsage(qaRes.usage);
+              postQaItems = mergeAuditedItems(deterministicCheck.normalizedItems, qaRes.items);
+              addLog(i, `Agent 3: Conditional QA complete.`, 'success');
+            } else {
+              addLog(i, `Agent 3: Skipped (no deterministic failures).`, 'success');
+            }
 
-            // STEP 4: Supervisor POST (AGENT 4)
+            // STEP 5: Final deterministic gate (ensures export-compatible shape)
+            setCurrentStep('export_validation');
+            const finalValidation = validateAuditDataDeterministically(MEDICAL_SCHEMA, postQaItems);
+            addLog(i, `Final Validator: ${finalValidation.failedBlocks.length === 0 ? 'Structure locked for export.' : `Normalized ${finalValidation.correctionCount} residual fields.`}`, finalValidation.failedBlocks.length === 0 ? 'success' : 'warning');
+
+            // STEP 6: Supervisor POST (AGENT 4)
             setCurrentStep('supervisor_post');
-            const postCheck = await callWithRetry(() => runSupervisorAgent(file, 'POST', qaFinal.items), 'Agent 4 (Supervisor Post)');
+            const postCheck = await callWithRetry(() => runSupervisorAgent(file, 'POST', finalValidation.normalizedItems), 'Agent 4 (Supervisor Post)');
             trackUsage(postCheck.usage);
             addLog(i, `Agent 4 (Final Check): ${postCheck.result}`, 'success');
-
-            await delay(2000);
-
-            // STEP 5: Export Validation Agent (EXCEL INTEGRITY GATE)
-            setCurrentStep('export_validation');
-            addLog(i, `Export Validation Agent: Verifying XLSX integrity...`, 'warning');
-            const exportValidRes = await callWithRetry(
-              () => runExportValidationAgent(file, qaFinal.items, MEDICAL_SCHEMA, (c, t) => setProgress({ current: c, total: t })),
-              'Export Validation Agent'
-            );
-            trackUsage(exportValidRes.usage);
-            addLog(i, `Export Validation Agent: 100% Match Confirmed. Gate Passed.`, 'success');
 
             // Finalize File
             setBatchResults(prev => {
@@ -308,20 +317,19 @@ export default function App() {
                 next[i] = {
                     ...next[i],
                     status: 'completed',
-                    results: exportValidRes.items, // Use the FINAL validated items
+                    results: finalValidation.normalizedItems,
                     supervisorIsolationCheck: postCheck.result
-                    // tokenUsage updated via trackUsage -> updateUsage
                 };
                 return next;
             });
-            
+
             // Construct result for history (using local currentUsage)
             saveToHistory({
                 fileName: file.name,
                 fileSize: file.size,
                 status: 'completed',
-                results: exportValidRes.items,
-                logs: [], // Omitting logs from history for cleaner storage
+                results: finalValidation.normalizedItems,
+                logs: [],
                 supervisorIsolationCheck: postCheck.result,
                 tokenUsage: currentUsage
             });
@@ -334,6 +342,12 @@ export default function App() {
                 next[i].status = 'error';
                 return next;
             });
+        }
+
+        // Add a cool-down delay between files to allow quota replenishment
+        if (i < files.length - 1) {
+          addLog(i, `Cooling down for 5s before next file...`, 'info');
+          await new Promise(resolve => setTimeout(resolve, 5000));
         }
     }
 
@@ -557,19 +571,28 @@ export default function App() {
                                     <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                                         <div className="px-5 py-4 border-b border-slate-200 bg-slate-50 flex justify-between items-center">
                                             <h3 className="font-bold text-slate-800">Extraction Results</h3>
-                                            <button 
-                                              onClick={() => downloadXLSX(batchResults[selectedFileIndex])}
-                                              className="text-xs font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1"
-                                            >
-                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                                                Download XLSX
-                                            </button>
+                                            <div className="flex gap-3">
+                                                <button
+                                                  onClick={() => generateExtractionReport(batchResults[selectedFileIndex])}
+                                                  className="text-xs font-bold text-rose-600 hover:text-rose-800 flex items-center gap-1 border border-rose-200 bg-rose-50 px-3 py-1.5 rounded-lg hover:bg-rose-100 transition-colors"
+                                                >
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                                    EXTRACTION
+                                                </button>
+                                                <button 
+                                                  onClick={() => downloadXLSX(batchResults[selectedFileIndex])}
+                                                  className="text-xs font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1 border border-indigo-200 bg-indigo-50 px-3 py-1.5 rounded-lg hover:bg-indigo-100 transition-colors"
+                                                >
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                                    Download XLSX
+                                                </button>
+                                            </div>
                                         </div>
                                         <div className="max-h-96 overflow-y-auto">
                                             <table className="w-full text-sm text-left">
                                                 <thead className="text-xs text-slate-500 uppercase bg-slate-50 sticky top-0">
                                                     <tr>
-                                                        <th className="px-6 py-3">Section</th>
+                                                        <th className="px-6 py-3">Section Name</th>
                                                         <th className="px-6 py-3">Question</th>
                                                         <th className="px-6 py-3">Answer</th>
                                                         <th className="px-6 py-3">Page</th>
@@ -637,11 +660,20 @@ export default function App() {
                                                 <span className="px-2 py-1 rounded-full text-xs font-bold bg-green-100 text-green-700">Completed</span>
                                             </td>
                                             <td className="px-6 py-4 flex gap-3">
+                                                <button
+                                                    onClick={() => generateExtractionReport(h)}
+                                                    className="text-rose-600 hover:text-rose-800 font-medium text-xs flex items-center gap-1"
+                                                    title="Generate Extraction PDF Report"
+                                                >
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
+                                                    EXTRACTION
+                                                </button>
                                                 <button 
                                                     onClick={() => downloadXLSX(h)}
-                                                    className="text-indigo-600 hover:text-indigo-800 font-medium"
+                                                    className="text-indigo-600 hover:text-indigo-800 font-medium text-xs flex items-center gap-1"
                                                 >
-                                                    Download XLSX
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                                    XLSX
                                                 </button>
                                                 <button 
                                                     onClick={() => {

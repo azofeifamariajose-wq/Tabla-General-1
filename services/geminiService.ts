@@ -5,6 +5,20 @@ import { generateContentWithRetry } from './apiWrapper';
 
 // Model Definitions
 const MODEL_FLASH = 'gemini-3-flash-preview';
+const DEFAULT_THINKING_BUDGET = 1024;
+const QA_THINKING_BUDGET = 2048;
+const DEFAULT_MAX_OUTPUT_TOKENS = 12000;
+
+const compactJson = (value: unknown) => JSON.stringify(value);
+const AGENT_BLOCK_CHUNK_SIZE = 3;
+
+const chunkBlocks = <T,>(items: T[], chunkSize: number): T[][] => {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += chunkSize) {
+    chunks.push(items.slice(i, i + chunkSize));
+  }
+  return chunks;
+};
 
 const fileToPart = async (file: File): Promise<{ inlineData: { data: string; mimeType: string } }> => {
   return new Promise((resolve, reject) => {
@@ -24,6 +38,16 @@ const mapUsage = (response: GenerateContentResponse): TokenUsage => {
     outputTokens: response.usageMetadata?.candidatesTokenCount || 0,
     totalTokens: response.usageMetadata?.totalTokenCount || 0
   };
+};
+
+const getSection14Reinforcement = (blockNumber: number): string => {
+  if (blockNumber !== 14) return "";
+
+  return `SECTION 14 REINFORCEMENT (CRITICAL):
+  - This block has frequent extraction/audit errors. Apply an additional verification pass before finalizing.
+  - Answer strictly from this PDF and schema instructions in constants.ts only; do not infer beyond explicit evidence.
+  - For every question, re-check answer-question alignment and ensure option values exactly match allowed schema options when present.
+  - If evidence is absent after exhaustive review, return "Not described" instead of guessing.`;
 };
 
 // --- ROBUST JSON SANITIZER & REPAIR UTILS ---
@@ -123,7 +147,7 @@ const cleanJson = (text: string | undefined): string => {
 /**
  * Safe wrapper for JSON.parse with error logging.
  */
-const safeJsonParse = <T>(jsonString: string, fallback: T): T => {
+const safeJsonParse = <T>(jsonString: string | undefined, fallback: T): T => {
   const cleaned = cleanJson(jsonString);
   try {
     return JSON.parse(cleaned);
@@ -327,7 +351,7 @@ export const runSupervisorAgent = async (
     file: File,
     mode: 'PRE' | 'POST',
     currentResults?: AuditItem[],
-): Promise<{result: string, usage: TokenUsage}> => {
+ ): Promise<{result: string, usage: TokenUsage}> => {
     if (!process.env.API_KEY) throw new Error("API Key is missing");
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const filePart = await fileToPart(file);
@@ -345,13 +369,13 @@ export const runSupervisorAgent = async (
            Ensure that 100% of the data in the results below corresponds ONLY to document "${file.name}".
            If you detect any data from other files or hallucinations, flag it.
            RESULTS TO VERIFY:
-           ${JSON.stringify(currentResults, null, 2)}
+           ${compactJson(currentResults)}
            OUTPUT: "ISOLATION VERIFIED" or a list of contamination errors.`;
 
     // Agent 4 uses Flash for speed on isolation checks
     const response = await generateContentWithRetry(ai, MODEL_FLASH, {
         contents: { parts: [filePart, { text: prompt }] },
-        config: { thinkingConfig: { thinkingBudget: 2048 } }
+        config: { thinkingConfig: { thinkingBudget: DEFAULT_THINKING_BUDGET } }
     });
 
     return { result: response.text || "Isolation Check Failed", usage: mapUsage(response) };
@@ -364,40 +388,45 @@ export const runExtractionAgent = async (
 ): Promise<{items: ExtractionItem[], usage: TokenUsage}> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
   const filePart = await fileToPart(file);
-  const blocks = schemaDef.blocks;
+  const blockChunks = chunkBlocks(schemaDef.blocks, AGENT_BLOCK_CHUNK_SIZE);
   const allItems: ExtractionItem[] = [];
   let totalUsage: TokenUsage = { promptTokens: 0, outputTokens: 0, totalTokens: 0 };
 
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i];
-    const currentBlockSchema = { ...schemaDef, blocks: [block] };
-    const prompt = `EXPERT MEDICAL EXTRACTOR. File: ${file.name}. Block ${block.block_number}: ${block.block_name}. 
-    STRICT RULE: ONLY EXTRACT FROM THIS FILE. DO NOT USE PRIOR KNOWLEDGE.
-    OUTPUT FORMAT: Return a valid JSON array matching the schema.
-    SCHEMA: ${JSON.stringify(currentBlockSchema, null, 2)}`;
+  for (let i = 0; i < blockChunks.length; i++) {
+    const chunk = blockChunks[i];
+    const chunkSchema = { ...schemaDef, blocks: chunk };
+    
+    // Check if the current chunk contains Block 14 (Vaccine Characteristics)
+    const hasBlock14 = chunk.some(b => b.block_number === 14);
+    const reinforcement = hasBlock14 ? getSection14Reinforcement(14) : "";
 
-    // Agent 1 uses Flash for efficiency on bulk extraction
+    const prompt = `EXPERT MEDICAL EXTRACTOR. File: ${file.name}.
+    STRICT RULE: ONLY EXTRACT FROM THIS FILE. DO NOT USE PRIOR KNOWLEDGE.
+    INSTRUCTION SOURCE OF TRUTH: Follow only the constraints/instructions defined in constants.ts via the schema below.
+    ${reinforcement}
+    OUTPUT FORMAT: Return a valid JSON array matching the schema.
+    PROCESS THESE BLOCKS IN ORDER: ${compactJson(chunk.map(b => ({ block_number: b.block_number, block_name: b.block_name })))}
+    SCHEMA: ${compactJson(chunkSchema)}`;
+
     const response = await generateContentWithRetry(ai, MODEL_FLASH, {
       contents: { parts: [filePart, { text: prompt }] },
       config: { 
           responseMimeType: "application/json", 
-          responseSchema: EXTRACTION_SCHEMA, 
-          // Increased thinking budget and maxOutputTokens to handle large blocks (like Section 14)
-          thinkingConfig: { thinkingBudget: 4096 },
-          maxOutputTokens: 30000 
+          responseSchema: EXTRACTION_SCHEMA,
+          thinkingConfig: { thinkingBudget: DEFAULT_THINKING_BUDGET },
+          maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS 
       }
     });
 
-    // Use safeJsonParse to ensure robustness against truncation or special chars
-    const blockItems = safeJsonParse<ExtractionItem[]>(response.text, []);
-    allItems.push(...blockItems);
-    
+    const chunkItems = safeJsonParse<ExtractionItem[]>(response.text || "[]", []);
+    allItems.push(...chunkItems);
+
     const usage = mapUsage(response);
     totalUsage.promptTokens += usage.promptTokens;
     totalUsage.outputTokens += usage.outputTokens;
     totalUsage.totalTokens += usage.totalTokens;
 
-    onProgress(i + 1, blocks.length);
+    onProgress(i + 1, blockChunks.length);
   }
 
   // --- APPLY CORRELATION BRANCH ADDON ---
@@ -412,7 +441,7 @@ export const runExtractionAgent = async (
 export const runAuditAgent = async (
   file: File, 
   originalData: ExtractionItem[], 
-  schemaDef: SchemaDef, // Added SchemaDef to context
+  schemaDef: SchemaDef,
   onProgress: (current: number, total: number) => void
 ): Promise<{items: AuditItem[], usage: TokenUsage}> => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
@@ -424,68 +453,33 @@ export const runAuditAgent = async (
         return acc;
     }, {} as Record<number, ExtractionItem[]>);
 
-    // Iterate over Schema blocks to ensure coverage, even if extraction missed it.
-    const blocks = schemaDef.blocks;
+    const blockChunks = chunkBlocks(schemaDef.blocks, AGENT_BLOCK_CHUNK_SIZE);
     const auditedItems: AuditItem[] = [];
     let totalUsage: TokenUsage = { promptTokens: 0, outputTokens: 0, totalTokens: 0 };
 
-    for (let i = 0; i < blocks.length; i++) {
-        const block = blocks[i];
-        const blockItems = itemsByBlock[block.block_number] || [];
+    for (let i = 0; i < blockChunks.length; i++) {
+        const chunk = blockChunks[i];
+        const chunkData = chunk.flatMap(block => itemsByBlock[block.block_number] || []);
 
-        const prompt = `STRICT MEDICAL AUDITOR. File: ${file.name}. 
-        Reviewing Block ${block.block_number}: ${block.block_name}.
-
-        YOU HAVE 5 CRITICAL MANDATES. EXECUTE THEM SEQUENTIALLY:
-
-        1. ANSWER-QUESTION ALIGNMENT:
-           - Verify that every 'answer' textually and logically matches its 'question'.
-           - If an answer is off-topic, generic, or mismatched, YOU MUST RETURN TO THE PDF SOURCE, find the correct information, and overwrite the bad data.
-
-        2. ZERO BLANKS POLICY:
-           - NO FIELD MAY REMAIN EMPTY.
-           - If an answer is "", null, "unknown", or missing, SEARCH THE PDF EXHAUSTIVELY.
-           - If found: Extract it.
-           - If TRULY not found after deep search: Use "Not described".
-           - DO NOT ALLOW BLANKS.
-
-        3. CONSTANT REFERENCE COMPLIANCE:
-           - Check the 'SCHEMA BLOCK' for 'options' and 'type'.
-           - Your output 'answer' MUST EXACTLY MATCH one of the provided options if defined.
-           - If the PDF says "GSK" but option is "GlaxoSmithKline", map it accurately.
-           - If format is "18 C", fix it to match schema (e.g., "18 months").
-
-        4. STRICT ORDER INTEGRITY:
-           - Your output JSON array must EXACTLY match the order of questions in the 'SCHEMA BLOCK'.
-           - Do not sort, do not shuffle, do not omit keys.
-
-        5. AUDIT COMPLETION GATE (INTERNAL CHECKLIST):
-           Before outputting JSON, ask yourself:
-           - All questions present? [ ]
-           - No blanks? [ ]
-           - Order matches Schema? [ ]
-           - Answers meaningful? [ ]
-           - Constants respected? [ ]
-           
-           IF ANY CHECK FAILS, RE-PROCESS THAT ITEM USING THE PDF BEFORE FINALIZING.
-
+        const prompt = `STRICT MEDICAL AUDITOR. File: ${file.name}.
+        Review all provided blocks and return one JSON array.
+        MANDATES: enforce answer-question alignment, no blanks (use "N/A" only if truly absent), exact constants/options, schema order, and for multi-select questions include ALL applicable options separated by semicolons.
+        INSTRUCTION SOURCE OF TRUTH: Use only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
         OUTPUT FORMAT: Return a valid JSON array matching the schema.
-        SCHEMA BLOCK: ${JSON.stringify(block, null, 2)}
-        CURRENT DATA: ${JSON.stringify(blockItems, null, 2)}`;
+        SCHEMA BLOCKS: ${compactJson(chunk)}
+        CURRENT DATA: ${compactJson(chunkData)}`;
 
-        // Agent 2 uses Flash as requested
         const response = await generateContentWithRetry(ai, MODEL_FLASH, {
             contents: { parts: [filePart, { text: prompt }] },
             config: { 
               responseMimeType: "application/json", 
               responseSchema: AUDIT_SCHEMA, 
-              thinkingConfig: { thinkingBudget: 4096 },
-              maxOutputTokens: 30000 
+              thinkingConfig: { thinkingBudget: DEFAULT_THINKING_BUDGET },
+              maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS 
             }
         });
         
-        // Use safeJsonParse to ensure robustness
-        const result = safeJsonParse<AuditItem[]>(response.text, []);
+        const result = safeJsonParse<AuditItem[]>(response.text || "[]", []);
         auditedItems.push(...result);
 
         const usage = mapUsage(response);
@@ -493,7 +487,7 @@ export const runAuditAgent = async (
         totalUsage.outputTokens += usage.outputTokens;
         totalUsage.totalTokens += usage.totalTokens;
 
-        onProgress(i + 1, blocks.length);
+        onProgress(i + 1, blockChunks.length);
     }
     return { items: auditedItems, usage: totalUsage };
   };
@@ -506,7 +500,6 @@ export const runQAAgent = async (
 ): Promise<{items: AuditItem[], usage: TokenUsage}> => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
     const filePart = await fileToPart(file);
-    const blocks = schemaDef.blocks;
     const finalQAItems: AuditItem[] = [];
     let totalUsage: TokenUsage = { promptTokens: 0, outputTokens: 0, totalTokens: 0 };
 
@@ -517,31 +510,29 @@ export const runQAAgent = async (
         return acc;
     }, {} as Record<number, AuditItem[]>);
 
-    for (let i = 0; i < blocks.length; i++) {
-        const block = blocks[i];
-        const prompt = `FINAL QA AUTHORITY. File: ${file.name}. Block ${block.block_number}.
-        
-        MANDATE:
-        1. CSV INTEGRITY & ORDER: The output JSON MUST contain an entry for EVERY question in the 'SCHEMA BLOCK', in the EXACT ORDER defined there.
-        2. NO MISSING FIELDS: Verify every single question has a non-empty answer. If still missing, fill with "Not described".
-        3. FINAL VALIDATION: Ensure the list structure matches the schema 1:1. This is critical for CSV column alignment.
+    const blockChunks = chunkBlocks(schemaDef.blocks, AGENT_BLOCK_CHUNK_SIZE);
 
-        SCHEMA BLOCK: ${JSON.stringify(block, null, 2)}
-        AUDITED DATA: ${JSON.stringify(auditedByBlock[block.block_number] || [], null, 2)}`;
+    for (let i = 0; i < blockChunks.length; i++) {
+        const chunk = blockChunks[i];
+        const chunkData = chunk.flatMap(block => auditedByBlock[block.block_number] || []);
+        const prompt = `FINAL QA AUTHORITY. File: ${file.name}.
+        Validate these blocks for CSV integrity and return one JSON array.
+        RULES: exact schema order, no missing fields, fill missing answers with "N/A", and for multi-select return all applicable options separated by semicolons.
+        INSTRUCTION SOURCE OF TRUTH: Validate using only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
+        SCHEMA BLOCKS: ${compactJson(chunk)}
+        AUDITED DATA: ${compactJson(chunkData)}`;
 
-        // Agent 3 uses Flash for efficiency/speed in final QA
         const response = await generateContentWithRetry(ai, MODEL_FLASH, {
             contents: { parts: [filePart, { text: prompt }] },
             config: { 
               responseMimeType: "application/json", 
               responseSchema: QA_SCHEMA, 
-              thinkingConfig: { thinkingBudget: 8192 },
-              maxOutputTokens: 30000 
+              thinkingConfig: { thinkingBudget: QA_THINKING_BUDGET },
+              maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS 
             }
         });
         
-        // Use safeJsonParse to ensure robustness
-        const result = safeJsonParse<AuditItem[]>(response.text, []);
+        const result = safeJsonParse<AuditItem[]>(response.text || "[]", []);
         finalQAItems.push(...result);
 
         const usage = mapUsage(response);
@@ -549,7 +540,7 @@ export const runQAAgent = async (
         totalUsage.outputTokens += usage.outputTokens;
         totalUsage.totalTokens += usage.totalTokens;
 
-        onProgress(i + 1, blocks.length);
+        onProgress(i + 1, blockChunks.length);
     }
     return { items: finalQAItems, usage: totalUsage };
 };
@@ -561,11 +552,7 @@ export const runExportValidationAgent = async (
   onProgress: (current: number, total: number) => void
 ): Promise<{items: AuditItem[], usage: TokenUsage}> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
-  // We typically don't need the PDF for structural validation of the JSON, but we pass it if needed. 
-  // For safety, we can pass it if the agent decides to look up something, but primarily this is a Logic/Structural check.
-  // We'll pass it to keep the interface consistent.
   const filePart = await fileToPart(file);
-  const blocks = schemaDef.blocks;
   const validatedItems: AuditItem[] = [];
   let totalUsage: TokenUsage = { promptTokens: 0, outputTokens: 0, totalTokens: 0 };
 
@@ -576,35 +563,29 @@ export const runExportValidationAgent = async (
       return acc;
   }, {} as Record<number, AuditItem[]>);
 
-  for (let i = 0; i < blocks.length; i++) {
-      const block = blocks[i];
-      const prompt = `EXPORT VALIDATION AGENT. File: ${file.name}. Block ${block.block_number}.
-      
-      CRITICAL OBJECTIVE: Guarantee 100% integrity for the Excel export.
-      
-      RESPONSIBILITIES:
-      1. 1:1 MAPPING CHECK: Verify each question key/ID maps to the correct Schema Question.
-      2. ORDER PRESERVATION: Confirm the output preserves the EXACT original question order from the Schema.
-      3. COMPLETENESS: Confirm NO BLANKS exist. If an answer is missing, fill it with "Not described" or extract if possible.
-      4. EXACT MATCH ASSERTION: The values must match the input audited values unless correcting a structure/blank error.
+  const blockChunks = chunkBlocks(schemaDef.blocks, AGENT_BLOCK_CHUNK_SIZE);
 
-      EXPORT VALIDATION GATE:
-      If any mismatch is detected, you MUST fix it in your output.
-      
-      SCHEMA BLOCK: ${JSON.stringify(block, null, 2)}
-      CANDIDATE DATA: ${JSON.stringify(dataByBlock[block.block_number] || [], null, 2)}`;
+  for (let i = 0; i < blockChunks.length; i++) {
+      const chunk = blockChunks[i];
+      const chunkData = chunk.flatMap(block => dataByBlock[block.block_number] || []);
+      const prompt = `EXPORT VALIDATION AGENT. File: ${file.name}.
+      Guarantee export integrity for all provided blocks.
+      RULES: 1:1 mapping, exact question order, no blanks, keep values unless fixing structural/blank issues.
+      INSTRUCTION SOURCE OF TRUTH: Enforce only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
+      SCHEMA BLOCKS: ${compactJson(chunk)}
+      CANDIDATE DATA: ${compactJson(chunkData)}`;
 
       const response = await generateContentWithRetry(ai, MODEL_FLASH, {
           contents: { parts: [filePart, { text: prompt }] },
           config: { 
             responseMimeType: "application/json", 
-            responseSchema: QA_SCHEMA, // Reuse QA schema as it matches structure
-            thinkingConfig: { thinkingBudget: 4096 },
-            maxOutputTokens: 30000 
+            responseSchema: QA_SCHEMA,
+            thinkingConfig: { thinkingBudget: DEFAULT_THINKING_BUDGET },
+            maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS 
           }
       });
       
-      const result = safeJsonParse<AuditItem[]>(response.text, []);
+      const result = safeJsonParse<AuditItem[]>(response.text || "[]", []);
       validatedItems.push(...result);
 
       const usage = mapUsage(response);
@@ -612,7 +593,7 @@ export const runExportValidationAgent = async (
       totalUsage.outputTokens += usage.outputTokens;
       totalUsage.totalTokens += usage.totalTokens;
 
-      onProgress(i + 1, blocks.length);
+      onProgress(i + 1, blockChunks.length);
   }
   return { items: validatedItems, usage: totalUsage };
 };

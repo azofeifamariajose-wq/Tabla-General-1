@@ -16,7 +16,7 @@ export const MEDICAL_SCHEMA: SchemaDef = {
               "key": "info_id",
               "label": "ID",
               "type": "text",
-              "default": ""
+              "instruction": "Use_Name_of_PDF"
             }
           ]
         },
@@ -877,13 +877,17 @@ export const MEDICAL_SCHEMA: SchemaDef = {
               "label": "Pharmaceutical Co /  Manufacturer of Vaccine Used in Group 2",
               "type": "multiple_select",
               "options": [
-                "D",
-                "T",
-                "wP",
-                "Hib",
-                "HepB",
-                "aP",
-                "IPV",
+                "Biological E. Limited",
+                "GSK",
+                "LG Chem Ltd.",
+                "Merck",
+                "Merck and Sanofi Pasteur",
+                "Panacea Biotec Ltd.",
+                "PT Bio Farma (Persero)",
+                "Sanofi Healthcare India Private Limited",
+                "Sanofi Pasteur",
+                "Serum Institute of India",
+                "SK YS Pharm",
                 "Other",
                 "N/A"
               ]
@@ -915,7 +919,8 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "IPV",
                 "Other",
                 "N/A"
-              ]
+              ],
+              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g3_brand_name",
@@ -945,7 +950,8 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "Vaxelis®",
                 "Other",
                 "N/A"
-              ]
+              ],
+              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g3_manufacturer",
@@ -965,19 +971,22 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "SK YS Pharm",
                 "Other",
                 "N/A"
-              ]
+              ],
+              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g3_num_pertussis_ags",
               "label": "No. of pertussis ags included in the vaccine of Group 3",
               "type": "single_select",
-              "options": ["1", "2", "3", "4", "5"]
+              "options": ["1", "2", "3", "4", "5", "N/A"],
+              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g3_pertussis_antigens_types",
               "label": "Type(s) of pertussis antigens included in group 3 (PT, FHA, PRN, FIM2 and/or FIM3)",
               "type": "multi_select", // Assuming multi_select is a valid string type in your logic
-              "options": ["PT", "FHA", "PRN", "FIM2", "FIM3"]
+              "options": ["PT", "FHA", "PRN", "FIM2", "FIM3", "N/A"],
+              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
 
             {
@@ -994,7 +1003,8 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "IPV",
                 "Other",
                 "N/A"
-              ]
+              ],
+              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g4_brand_name",
@@ -1024,7 +1034,8 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "Vaxelis®",
                 "Other",
                 "N/A"
-              ]
+              ],
+              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g4_manufacturer",
@@ -1044,19 +1055,22 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "SK YS Pharm",
                 "Other",
                 "N/A"
-              ]
+              ],
+              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g4_num_pertussis_ags",
               "label": "No. of pertussis ags included in the vaccine of Group 4",
               "type": "single_select",
-              "options": ["1", "2", "3", "4", "5"]
+              "options": ["1", "2", "3", "4", "5", "N/A"],
+              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g4_pertussis_antigens_types",
               "label": "Type(s) of pertussis antigens included in group 4(PT, FHA, PRN, FIM2 and/or FIM3)",
               "type": "multi_select", // Assuming multi_select is a valid string type in your logic
-              "options": ["PT", "FHA", "PRN", "FIM2", "FIM3"]
+              "options": ["PT", "FHA", "PRN", "FIM2", "FIM3", "N/A"],
+              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
 
             { "key": "vac_more_than_4_groups_description", "label": "Description: same details if the study includes more than 4 groups", "type": "text" },
