@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:validation": "npx esbuild tests/validation.test.ts --bundle --platform=node --format=esm --outfile=.tmp-test/validation.test.mjs && node .tmp-test/validation.test.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.32.0",

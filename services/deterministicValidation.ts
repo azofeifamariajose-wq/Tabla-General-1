@@ -2,9 +2,7 @@
 import { AuditItem, QuestionDef, SchemaDef } from '../types';
 
 const normalizeText = (value?: string) => (value || '').trim();
-
 const normalizeForCompare = (value?: string) => normalizeText(value).toLowerCase();
-
 const buildItemKey = (blockId: number, question: string) => `${blockId}::${normalizeForCompare(question)}`;
 
 const isMultiSelectType = (type?: string) => {
@@ -14,89 +12,128 @@ const isMultiSelectType = (type?: string) => {
 
 const parseMultiSelectValues = (value: string): string[] => {
   return value
-    .split(/\n|,|;|\||\/|\band\b/gi)
+    .split(';')
     .map(part => normalizeText(part))
     .filter(Boolean);
 };
 
-const normalizeOptionValue = (value: string, options: string[]): string => {
-  const exactMatch = options.find(opt => normalizeForCompare(opt) === normalizeForCompare(value));
-  if (exactMatch) return exactMatch;
+const isNAValue = (value?: string) => normalizeForCompare(value) === 'n/a';
 
-  const containsMatch = options.find(opt => {
-    const normalizedOption = normalizeForCompare(opt);
-    const normalizedValue = normalizeForCompare(value);
-    return normalizedValue.includes(normalizedOption) || normalizedOption.includes(normalizedValue);
+const isEmptyAnswer = (value?: string) => {
+  const normalized = normalizeForCompare(value);
+  return !normalized || normalized === 'null' || normalized === 'undefined';
+};
+
+const hasTraceEvidence = (item?: AuditItem): boolean => {
+  if (!item) return false;
+  const page = normalizeForCompare(item.page_number);
+  const reasoning = normalizeText(item.reasoning);
+  const validPage = Boolean(page) && page !== 'n/a' && page !== 'not described';
+  return validPage && reasoning.length > 8;
+};
+
+const isValidSingleOption = (answer: string, options: string[]) => options.includes(answer);
+
+const validateMultiSelectExact = (answer: string, options: string[]): boolean => {
+  const parts = parseMultiSelectValues(answer);
+  if (parts.length === 0) return false;
+  if (parts.some(part => !options.includes(part))) return false;
+
+  const naSelected = parts.includes('N/A');
+  if (naSelected && parts.length > 1) return false;
+
+  return new Set(parts).size === parts.length;
+};
+
+const findComparativeGroupCount = (items: AuditItem[]): number | null => {
+  const countItem = items.find(item => {
+    const question = normalizeForCompare(item.question);
+    return question.includes('number of compartive groups described') || question.includes('number of comparative groups described');
   });
 
-  if (containsMatch) return containsMatch;
-
-  const na = options.find(opt => normalizeForCompare(opt) === 'n/a');
-  if (na) return na;
-
-  const notDescribed = options.find(opt => normalizeForCompare(opt) === 'not described');
-  return notDescribed || 'N/A';
+  if (!countItem) return null;
+  const match = (countItem.answer || '').match(/\d+/);
+  if (!match) return null;
+  return Number(match[0]);
 };
 
-const normalizeMultiSelectValue = (value: string, options: string[]): string => {
-  const parts = parseMultiSelectValues(value);
-  const selected: string[] = [];
-
-  for (const option of options) {
-    const normalizedOption = normalizeForCompare(option);
-    const wasMentioned = parts.some(part => {
-      const normalizedPart = normalizeForCompare(part);
-      return normalizedPart === normalizedOption || normalizedPart.includes(normalizedOption) || normalizedOption.includes(normalizedPart);
-    });
-    if (wasMentioned) selected.push(option);
-  }
-
-  // --- NEW LOGIC: Enforce exclusive N/A for multi-select ---
-  // If 'N/A' is selected, it must be the ONLY selection.
-  const naOption = options.find(opt => normalizeForCompare(opt) === 'n/a');
-  if (naOption && selected.includes(naOption)) {
-      return naOption;
-  }
-  // --- END NEW LOGIC ---
-
-  if (selected.length === 0) {
-    const na = options.find(opt => normalizeForCompare(opt) === 'n/a');
-    if (na) return na;
-    const notDescribed = options.find(opt => normalizeForCompare(opt) === 'not described');
-    if (notDescribed) return notDescribed;
-    return 'N/A';
-  }
-
-  return selected.join('; ');
+const isDependentOnGroup = (questionLabel: string, groupNumber: number) => {
+  return new RegExp(`\\bgroup\\s*${groupNumber}\\b`, 'i').test(questionLabel);
 };
 
-const getDefaultAnswer = (question: QuestionDef): string => {
-  const schemaDefault = normalizeText(question.default);
-  if (schemaDefault) return schemaDefault;
+const buildDefaultItem = (blockNumber: number, sectionName: string, questionLabel: string): AuditItem => ({
+  block_id: blockNumber,
+  section_name: sectionName,
+  question: questionLabel,
+  answer: 'N/A',
+  page_number: 'N/A',
+  reasoning: 'N/A',
+  status: 'CORRECTED',
+  auditor_notes: 'Deterministic validator defaulted to N/A.',
+});
 
-  if (question.options && question.options.length > 0) {
-    return normalizeOptionValue('N/A', question.options);
-  }
-
-  return 'N/A';
-};
+export interface ValidationIssue {
+  questionKey: string;
+  currentAnswer: string;
+  reason: string;
+  recheckStep: 'extraction' | 'audit' | 'qa' | 'export';
+}
 
 export interface ValidationResult {
   normalizedItems: AuditItem[];
   failedBlocks: number[];
   correctionCount: number;
+  issues: ValidationIssue[];
+  isValid: boolean;
 }
 
 export const validateAuditDataDeterministically = (
   schemaDef: SchemaDef,
-  rawItems: AuditItem[]
+  rawItems: AuditItem[],
+  recheckStep: ValidationIssue['recheckStep']
 ): ValidationResult => {
   const failedBlockSet = new Set<number>();
+  const issues: ValidationIssue[] = [];
   let correctionCount = 0;
+
+  const duplicateCounter = new Map<string, number>();
+  for (const item of rawItems) {
+    const key = buildItemKey(item.block_id || 0, item.question || '');
+    duplicateCounter.set(key, (duplicateCounter.get(key) || 0) + 1);
+  }
 
   const itemMap = new Map<string, AuditItem>();
   for (const item of rawItems) {
-    itemMap.set(buildItemKey(item.block_id || 0, item.question), item);
+    itemMap.set(buildItemKey(item.block_id || 0, item.question || ''), item);
+  }
+
+  const comparativeGroupCount = findComparativeGroupCount(rawItems);
+  const expectedOrder = new Map<string, number>();
+  let orderIndex = 0;
+  for (const block of schemaDef.blocks) {
+    for (const section of block.sections) {
+      for (const question of section.questions) {
+        expectedOrder.set(buildItemKey(block.block_number, question.label), orderIndex++);
+      }
+    }
+  }
+
+  let lastSeenOrder = -1;
+  for (const raw of rawItems) {
+    const key = buildItemKey(raw.block_id || 0, raw.question || '');
+    const expected = expectedOrder.get(key);
+    if (expected === undefined) continue;
+    if (expected < lastSeenOrder) {
+      issues.push({
+        questionKey: `${raw.block_id || 0}::${raw.question}`,
+        currentAnswer: normalizeText(raw.answer),
+        reason: 'Items are misordered relative to schema.',
+        recheckStep
+      });
+      failedBlockSet.add(raw.block_id || 0);
+      break;
+    }
+    lastSeenOrder = expected;
   }
 
   const normalizedItems: AuditItem[] = [];
@@ -104,55 +141,102 @@ export const validateAuditDataDeterministically = (
   for (const block of schemaDef.blocks) {
     for (const section of block.sections) {
       for (const question of section.questions) {
-        const byLabel = itemMap.get(buildItemKey(block.block_number, question.label));
-        const byKey = itemMap.get(buildItemKey(block.block_number, question.key));
-        const source = byLabel || byKey;
+        const questionKey = `${block.block_number}::${question.key}`;
+        const lookupByLabel = itemMap.get(buildItemKey(block.block_number, question.label));
+        const lookupByKey = itemMap.get(buildItemKey(block.block_number, question.key));
+        const source = lookupByLabel || lookupByKey;
 
-        const answerBefore = normalizeText(source?.answer);
-        let answer = answerBefore;
+        const normalizedItem: AuditItem = source
+          ? { ...source, block_id: block.block_number, section_name: section.section_name, question: question.label }
+          : buildDefaultItem(block.block_number, section.section_name, question.label);
 
-        if (!answer) {
-          answer = getDefaultAnswer(question);
+        const duplicateKey = buildItemKey(block.block_number, source?.question || question.label);
+        if ((duplicateCounter.get(duplicateKey) || 0) > 1) {
+          issues.push({
+            questionKey,
+            currentAnswer: normalizeText(source?.answer),
+            reason: 'Duplicate answers found for the same question.',
+            recheckStep
+          });
+          failedBlockSet.add(block.block_number);
+        }
+
+        if (!source || isEmptyAnswer(source.answer)) {
+          normalizedItem.answer = 'N/A';
+          normalizedItem.page_number = 'N/A';
+          normalizedItem.reasoning = 'N/A';
+          normalizedItem.status = 'CORRECTED';
+          normalizedItem.auditor_notes = 'Missing answer. Forced to N/A pending re-check.';
+          issues.push({
+            questionKey,
+            currentAnswer: normalizeText(source?.answer),
+            reason: 'Required question is empty/undefined/null.',
+            recheckStep
+          });
           correctionCount++;
           failedBlockSet.add(block.block_number);
         }
 
-        if (question.options && question.options.length > 0) {
-          const normalized = isMultiSelectType(question.type)
-            ? normalizeMultiSelectValue(answer, question.options)
-            : normalizeOptionValue(answer, question.options);
-          if (normalized !== answer) {
-            answer = normalized;
+        if (question.options && question.options.length > 0 && !isNAValue(normalizedItem.answer)) {
+          const validOption = isMultiSelectType(question.type)
+            ? validateMultiSelectExact(normalizedItem.answer, question.options)
+            : isValidSingleOption(normalizedItem.answer, question.options);
+
+          if (!validOption) {
+            issues.push({
+              questionKey,
+              currentAnswer: normalizedItem.answer,
+              reason: 'Answer does not exactly match allowed options.',
+              recheckStep
+            });
+            normalizedItem.answer = 'N/A';
+            normalizedItem.page_number = 'N/A';
+            normalizedItem.reasoning = 'N/A';
+            normalizedItem.status = 'CORRECTED';
+            normalizedItem.auditor_notes = 'Invalid option value. Forced to N/A pending re-check.';
             correctionCount++;
             failedBlockSet.add(block.block_number);
           }
         }
 
-        const wasQuestionRemapped = source ? normalizeForCompare(source.question) !== normalizeForCompare(question.label) : true;
-        if (wasQuestionRemapped) {
-          failedBlockSet.add(block.block_number);
+        if (!isNAValue(normalizedItem.answer) && !hasTraceEvidence(normalizedItem)) {
+          issues.push({
+            questionKey,
+            currentAnswer: normalizedItem.answer,
+            reason: 'Non-N/A answer lacks required trace evidence.',
+            recheckStep
+          });
+          normalizedItem.answer = 'N/A';
+          normalizedItem.page_number = 'N/A';
+          normalizedItem.reasoning = 'N/A';
+          normalizedItem.status = 'CORRECTED';
+          normalizedItem.auditor_notes = 'Missing trace evidence. Forced to N/A.';
           correctionCount++;
+          failedBlockSet.add(block.block_number);
         }
 
-        const existingReasoning = normalizeText(source?.reasoning);
-        const reasons: string[] = [];
-        if (!answerBefore) reasons.push('Filled blank answer');
-        if (question.options && question.options.length > 0 && answer !== answerBefore) reasons.push('Normalized option value');
-        if (wasQuestionRemapped) reasons.push('Re-aligned question order');
+        if (comparativeGroupCount !== null && comparativeGroupCount >= 0) {
+          for (let group = comparativeGroupCount + 1; group <= 8; group++) {
+            if (isDependentOnGroup(question.label, group) && !isNAValue(normalizedItem.answer)) {
+              normalizedItem.answer = 'N/A';
+              normalizedItem.page_number = 'N/A';
+              normalizedItem.reasoning = 'N/A';
+              normalizedItem.status = 'CORRECTED';
+              normalizedItem.auditor_notes = `Group ${group} not present in source. Forced to N/A.`;
+              issues.push({
+                questionKey,
+                currentAnswer: source?.answer || '',
+                reason: `Question depends on Group ${group}, but source declares fewer groups.`,
+                recheckStep
+              });
+              correctionCount++;
+              failedBlockSet.add(block.block_number);
+              break;
+            }
+          }
+        }
 
-        normalizedItems.push({
-          block_id: block.block_number,
-          section_name: section.section_name,
-          question: question.label,
-          answer,
-          page_number: normalizeText(source?.page_number) || 'Not described',
-          reasoning: [existingReasoning, reasons.length ? `[Validator] ${reasons.join('; ')}` : ''].filter(Boolean).join(' | '),
-          status: source?.status || (reasons.length ? 'CORRECTED' : 'VERIFIED'),
-          original_answer: source?.original_answer,
-          auditor_notes: normalizeText(source?.auditor_notes) || (reasons.length ? 'Deterministic validator adjusted value/structure.' : 'Validated by deterministic rules.'),
-          qa_status: source?.qa_status,
-          qa_notes: source?.qa_notes,
-        });
+        normalizedItems.push(normalizedItem);
       }
     }
   }
@@ -160,6 +244,8 @@ export const validateAuditDataDeterministically = (
   return {
     normalizedItems,
     failedBlocks: Array.from(failedBlockSet),
-    correctionCount
+    correctionCount,
+    issues,
+    isValid: issues.length === 0
   };
 };

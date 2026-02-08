@@ -1,6 +1,6 @@
 
 import { GoogleGenAI, Type, Schema, GenerateContentResponse } from "@google/genai";
-import { SchemaDef, ExtractionItem, AuditItem, TokenUsage } from '../types';
+import { SchemaDef, ExtractionItem, AuditItem, TokenUsage, BlockDef } from '../types';
 import { generateContentWithRetry } from './apiWrapper';
 
 // Model Definitions
@@ -40,14 +40,30 @@ const mapUsage = (response: GenerateContentResponse): TokenUsage => {
   };
 };
 
-const getSection14Reinforcement = (blockNumber: number): string => {
-  if (blockNumber !== 14) return "";
+const getBlockReinforcement = (blocks: { block_number: number }[]): string => {
+  const instructions: string[] = [];
 
-  return `SECTION 14 REINFORCEMENT (CRITICAL):
+  // Block 14 Reinforcement
+  if (blocks.some(b => b.block_number === 14)) {
+    instructions.push(`SECTION 14 REINFORCEMENT (CRITICAL):
   - This block has frequent extraction/audit errors. Apply an additional verification pass before finalizing.
   - Answer strictly from this PDF and schema instructions in constants.ts only; do not infer beyond explicit evidence.
   - For every question, re-check answer-question alignment and ensure option values exactly match allowed schema options when present.
-  - If evidence is absent after exhaustive review, return "Not described" instead of guessing.`;
+  - If evidence is absent after exhaustive review, return "Not described" instead of guessing.`);
+  }
+
+  // Blocks 22-26 Reinforcement (Conclusions, Limitations, Notes)
+  const finalBlocks = [22, 23, 24, 25, 26];
+  if (blocks.some(b => finalBlocks.includes(b.block_number))) {
+    instructions.push(`FINAL SECTIONS REINFORCEMENT (Blocks 22-26):
+  - These qualitative sections (Conclusions, Limitations, Methodological Problems, Notes) must be populated.
+  - Extract comprehensive text from the Discussion, Conclusion, or Limitation sections of the PDF.
+  - "Notes" (Block 26) should capture any significant study anomalies, funding issues, or conflicts of interest if mentioned.
+  - Do not output "N/A" for these fields unless the paper is completely devoid of text. Always attempt to summarize the authors' intent/findings.
+  - For "Observed Methodological Problems", if none are explicitly stated, look for discussion on biases or confounding factors.`);
+  }
+
+  return instructions.join("\n\n");
 };
 
 const normalizeSelectAnswersAndMissingGroups = <T extends ExtractionItem | AuditItem>(
@@ -235,122 +251,6 @@ const safeJsonParse = <T>(jsonString: string | undefined, fallback: T): T => {
   }
 };
 
-// --- CORRELATION BRANCH (Normalization Addon) ---
-
-const BRAND_CORRELATIONS: Record<string, string> = {
-  "adacel": "Adacel®",
-  "boostrix": "Boostrix®",
-  "combe five": "ComBE Five®",
-  "daptacel": "Daptacel®",
-  "easyfive-tt": "Easyfive-TT®",
-  "eupenta": "Eupenta®",
-  "hexaxim": "Hexaxim®",
-  "infanrix": "Infanrix®",
-  "infanrix-ipv": "Infanrix®-IPV",
-  "infanrix hexa": "Infanrix® Hexa",
-  "infanrix penta": "Infanrix Penta®",
-  "pediarix": "Pediarix®",
-  "pentavac pfs": "Pentavac® PFS/SD",
-  "pentavac sd": "Pentavac® PFS/SD",
-  "pentavac": "Pentavac® PFS/SD",
-  "pentacel": "Pentacel®",
-  "pentaxim": "Pentaxim®",
-  "pentalab": "Pentalab®",
-  "quadracel": "Quadracel®",
-  "quinvaxem": "Quinvaxem®",
-  "tetraxim": "Tetraxim®",
-  "tritanrix": "Tritanrix®",
-  "vaxelis": "Vaxelis®"
-};
-
-const MANUFACTURER_CORRELATIONS: Record<string, string> = {
-  "biological evans private limited": "Biological E. Limited",
-  "glaxosmithkline": "GSK",
-  "smithkline beecham biologicals": "GSK",
-  "smithkline beecham": "GSK",
-  "glaxo laboratories": "GSK",
-  "glaxo holdings": "GSK",
-  "smithkline beecham plc": "GSK",
-  "glaxo wellcome plc": "GSK",
-  "glaxosmithkline plc": "GSK",
-  "gsk plc": "GSK",
-  "lg chemical": "LG Chem Ltd.",
-  "lak hui chemical industrial corp.": "LG Chem Ltd.",
-  "lucky chemical industries co. ltd.": "LG Chem Ltd.",
-  "lucky ltd.": "LG Chem Ltd.",
-  "lg chem investment ltd.": "LG Chem Ltd.",
-  "panacea biotec limited": "Panacea Biotec Ltd.",
-  "panacea drugs private limited": "Panacea Biotec Ltd.",
-  "radicura pharmaceuticals": "Panacea Biotec Ltd.",
-  "radicura pharma": "Panacea Biotec Ltd.",
-  "panacea biotec pharma": "Panacea Biotec Ltd.",
-  "panacea biotec pharma limited": "Panacea Biotec Ltd.",
-  "parc-vaccinogène": "PT Bio Farma (Persero)",
-  "landskoepoek inrichting en instituut pasteur": "PT Bio Farma (Persero)",
-  "bandung boeki kenkyusho": "PT Bio Farma (Persero)",
-  "pn pasteur": "PT Bio Farma (Persero)",
-  "pn bio farma": "PT Bio Farma (Persero)",
-  "perum bio farma": "PT Bio Farma (Persero)",
-  "institut pasteur": "Sanofi Pasteur",
-  "pasteur vaccins": "Sanofi Pasteur",
-  "pasteur mérieux connaught": "Sanofi Pasteur",
-  "aventis pasteur": "Sanofi Pasteur",
-  "sanofi": "Sanofi Pasteur",
-  "serum institute of india private": "Serum Institute of India",
-  "sii": "Serum Institute of India",
-  "serum institute of india private limited": "Serum Institute of India"
-};
-
-/**
- * Applies correlation logic to extracted items.
- * Normalizes Brand Names and Manufacturer names based on strict interpretation rules.
- */
-const applyCorrelationRules = (items: ExtractionItem[]): ExtractionItem[] => {
-  return items.map(item => {
-    const newItem = { ...item };
-    if (!newItem.answer) return newItem;
-
-    // Clean answer for matching (remove trademark symbols temporarily, lowercase, trim)
-    const lowerAnswer = newItem.answer.toLowerCase().replace(/[®™]/g, '').trim();
-    const lowerQuestion = item.question.toLowerCase();
-    
-    // 1. Check if question relates to Brand Name
-    if (lowerQuestion.includes("brand") || lowerQuestion.includes("commercial name")) {
-        // Sort keys by length descending to ensure "Pentavac PFS" is matched before "Pentavac"
-        const sortedKeys = Object.keys(BRAND_CORRELATIONS).sort((a, b) => b.length - a.length);
-        
-        for (const key of sortedKeys) {
-            // Check for containment. If the extracted answer contains the key, we map it.
-            if (lowerAnswer.includes(key)) {
-                newItem.answer = BRAND_CORRELATIONS[key];
-                // Append logic note if changed
-                if (newItem.answer !== item.answer) {
-                    newItem.reasoning = (newItem.reasoning || "") + ` [Auto-Correlated: matched "${key}" -> normalized to "${BRAND_CORRELATIONS[key]}"]`;
-                }
-                break; // Stop after first match
-            }
-        }
-    }
-
-    // 2. Check if question relates to Manufacturer
-    if (lowerQuestion.includes("manufacturer") || lowerQuestion.includes("pharmaceutical co")) {
-         const sortedKeys = Object.keys(MANUFACTURER_CORRELATIONS).sort((a, b) => b.length - a.length);
-         
-         for (const key of sortedKeys) {
-             if (lowerAnswer.includes(key)) {
-                newItem.answer = MANUFACTURER_CORRELATIONS[key];
-                if (newItem.answer !== item.answer) {
-                    newItem.reasoning = (newItem.reasoning || "") + ` [Auto-Correlated: matched "${key}" -> normalized to "${MANUFACTURER_CORRELATIONS[key]}"]`;
-                }
-                break;
-             }
-         }
-    }
-    
-    return newItem;
-  });
-};
-
 // --- AGENTS ---
 
 const EXTRACTION_SCHEMA: Schema = {
@@ -461,9 +361,8 @@ export const runExtractionAgent = async (
     const chunk = blockChunks[i];
     const chunkSchema = { ...schemaDef, blocks: chunk };
     
-    // Check if the current chunk contains Block 14 (Vaccine Characteristics)
-    const hasBlock14 = chunk.some(b => b.block_number === 14);
-    const reinforcement = hasBlock14 ? getSection14Reinforcement(14) : "";
+    // Get reinforcement for this specific chunk (Block 14 or 22-26)
+    const reinforcement = getBlockReinforcement(chunk);
 
     const prompt = `EXPERT MEDICAL EXTRACTOR. File: ${file.name}.
     STRICT RULE: ONLY EXTRACT FROM THIS FILE. DO NOT USE PRIOR KNOWLEDGE.
@@ -494,10 +393,6 @@ export const runExtractionAgent = async (
     onProgress(i + 1, blockChunks.length);
   }
 
-  // --- APPLY CORRELATION BRANCH ADDON ---
-  // Normalizes brands and manufacturers before returning results
-  // const correlatedItems = applyCorrelationRules(allItems); // Correlation turned off per request
-  
   // Apply Group Normalization (N/A for missing groups)
   const finalItems = normalizeSelectAnswersAndMissingGroups(allItems, schemaDef);
 
@@ -527,13 +422,14 @@ export const runAuditAgent = async (
         const chunk = blockChunks[i];
         const chunkData = chunk.flatMap(block => itemsByBlock[block.block_number] || []);
         
-        // Check if the current chunk contains Block 14 (Vaccine Characteristics)
-        const hasBlock14 = chunk.some(b => b.block_number === 14);
-        const reinforcement = hasBlock14 ? getSection14Reinforcement(14) : "";
+        // Get reinforcement for this specific chunk (Block 14 or 22-26)
+        const reinforcement = getBlockReinforcement(chunk);
 
         const prompt = `STRICT MEDICAL AUDITOR. File: ${file.name}.
         Review all provided blocks and return one JSON array.
-        MANDATES: enforce answer-question alignment, no blanks (use "N/A" only if truly absent), exact constants/options, schema order, and for multi-select questions include ALL applicable options separated by semicolons.
+        MANDATES: enforce answer-question alignment, no blanks (use "N/A" only if truly absent), exact constants/options (case+spacing exact), schema order, and for multi-select questions include ALL applicable options separated by semicolons.
+        TRACE RULE: Every non-"N/A" answer must include page_number and a short quote/excerpt in reasoning; if missing evidence use "N/A".
+        CERTAINTY RULE: Never keep uncertain answers. Overwrite uncertain values with corrected value or "N/A".
         INSTRUCTION SOURCE OF TRUTH: Use only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
         ${reinforcement}
         OUTPUT FORMAT: Return a valid JSON array matching the schema.
@@ -589,13 +485,15 @@ export const runQAAgent = async (
         const chunk = blockChunks[i];
         const chunkData = chunk.flatMap(block => auditedByBlock[block.block_number] || []);
         
-        // Check if the current chunk contains Block 14 (Vaccine Characteristics)
-        const hasBlock14 = chunk.some(b => b.block_number === 14);
-        const reinforcement = hasBlock14 ? getSection14Reinforcement(14) : "";
+        // Get reinforcement for this specific chunk (Block 14 or 22-26)
+        const reinforcement = getBlockReinforcement(chunk);
 
         const prompt = `FINAL QA AUTHORITY. File: ${file.name}.
         Validate these blocks for CSV integrity and return one JSON array.
         RULES: exact schema order, no missing fields, fill missing answers with "N/A", and for multi-select return all applicable options separated by semicolons.
+        TRACE RULE: Every non-"N/A" answer must include page_number and quote/excerpt evidence in reasoning.
+        DUPLICATE RULE: one question -> one final answer.
+        CERTAINTY RULE: If uncertain or unsupported, set "N/A".
         INSTRUCTION SOURCE OF TRUTH: Validate using only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
         ${reinforcement}
         SCHEMA BLOCKS: ${compactJson(chunk)}
@@ -650,13 +548,13 @@ export const runExportValidationAgent = async (
       const chunk = blockChunks[i];
       const chunkData = chunk.flatMap(block => dataByBlock[block.block_number] || []);
 
-      // Check if the current chunk contains Block 14 (Vaccine Characteristics)
-      const hasBlock14 = chunk.some(b => b.block_number === 14);
-      const reinforcement = hasBlock14 ? getSection14Reinforcement(14) : "";
+      // Get reinforcement for this specific chunk (Block 14 or 22-26)
+      const reinforcement = getBlockReinforcement(chunk);
 
       const prompt = `EXPORT VALIDATION AGENT. File: ${file.name}.
       Guarantee export integrity for all provided blocks.
       RULES: 1:1 mapping, exact question order, no blanks, keep values unless fixing structural/blank issues.
+      HARD VALIDATION: non-"N/A" answers require trace evidence; invalid options are not allowed; duplicates are not allowed.
       INSTRUCTION SOURCE OF TRUTH: Enforce only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
       ${reinforcement}
       SCHEMA BLOCKS: ${compactJson(chunk)}
@@ -685,4 +583,42 @@ export const runExportValidationAgent = async (
   
   const normalizedValidatedItems = normalizeSelectAnswersAndMissingGroups(validatedItems, schemaDef);
   return { items: normalizedValidatedItems, usage: totalUsage };
+};
+
+export const runTargetedRecheckAgent = async (
+  file: File,
+  schemaDef: SchemaDef,
+  failedQuestions: string[],
+  currentData: AuditItem[],
+  phase: 'EXTRACTION' | 'AUDIT' | 'QA' | 'EXPORT',
+  onProgress: (current: number, total: number) => void
+): Promise<{items: AuditItem[], usage: TokenUsage}> => {
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
+  const filePart = await fileToPart(file);
+  const normalizedFailedQuestions = Array.from(new Set(failedQuestions.map(q => q.trim()).filter(Boolean)));
+
+  const prompt = `TARGETED RECHECK AGENT (${phase}). File: ${file.name}.
+  Re-evaluate ONLY the failed questions listed below against this PDF.
+  HARD RULES:
+  - Never infer values. If evidence is absent, answer must be exactly "N/A".
+  - For option questions, answer must match schema options exactly (case/spacing).
+  - Every non-"N/A" answer requires trace evidence (page_number + excerpt in reasoning).
+  - Return exactly one answer per question.
+  FAILED QUESTIONS: ${compactJson(normalizedFailedQuestions)}
+  SCHEMA BLOCKS: ${compactJson(schemaDef.blocks)}
+  CURRENT DATA: ${compactJson(currentData)}`;
+
+  const response = await generateContentWithRetry(ai, MODEL_FLASH, {
+    contents: { parts: [filePart, { text: prompt }] },
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: QA_SCHEMA,
+      thinkingConfig: { thinkingBudget: QA_THINKING_BUDGET },
+      maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS
+    }
+  });
+
+  onProgress(1, 1);
+  const items = safeJsonParse<AuditItem[]>(response.text || "[]", []);
+  return { items, usage: mapUsage(response) };
 };

@@ -1,8 +1,9 @@
+
 import React, { useState, useEffect } from 'react';
 import { FileUpload } from './components/FileUpload';
 import { Login } from './components/Login';
 import { MEDICAL_SCHEMA } from './constants';
-import { runExtractionAgent, runAuditAgent, runQAAgent, runSupervisorAgent } from './services/geminiService';
+import { runExtractionAgent, runAuditAgent, runQAAgent, runSupervisorAgent, runTargetedRecheckAgent } from './services/geminiService';
 import { generateExtractionReport } from './services/pdfService';
 import { LogEntry, ProcessStatus, FileResult, AgentStep, User, TokenUsage, AuditItem, SchemaDef } from './types';
 import * as XLSX from 'xlsx';
@@ -43,7 +44,7 @@ const getWideCSVData = (result: FileResult) => {
         // NOTE: Previous fuzzy label logic (includes) was removed because it caused data shifting 
         // when one question label was a substring of another.
 
-        rowData.push(item ? item.answer : "");
+        rowData.push(item ? item.answer : "N/A");
       });
     });
   });
@@ -54,6 +55,15 @@ const getWideCSVData = (result: FileResult) => {
 const mergeAuditedItems = (baseItems: AuditItem[], qaItems: AuditItem[]): AuditItem[] => {
   const qaByKey = new Map(qaItems.map(item => [`${item.block_id}::${item.question.trim().toLowerCase()}`, item]));
   return baseItems.map(item => qaByKey.get(`${item.block_id}::${item.question.trim().toLowerCase()}`) || item);
+};
+
+const buildStructuredValidationErrorReport = (issues: ReturnType<typeof validateAuditDataDeterministically>['issues']) => {
+  return issues.map(issue => ({
+    question_key: issue.questionKey,
+    current_answer: issue.currentAnswer,
+    why_invalid: issue.reason,
+    recheck_step: issue.recheckStep
+  }));
 };
 
 const buildSchemaSubset = (schema: SchemaDef, blockNumbers: number[]): SchemaDef => ({
@@ -279,33 +289,71 @@ export default function App() {
             addLog(i, `Agent 2: Audit complete.`, 'info');
 
 
-            // STEP 3: Deterministic Validation (ORDER + COMPLETENESS + OPTIONS + DEFAULT FILL)
-            const deterministicCheck = validateAuditDataDeterministically(MEDICAL_SCHEMA, auditRes.items);
+            // STEP 3: Deterministic Validation (ORDER + COMPLETENESS + OPTIONS + TRACE + N/A POLICY)
+            const deterministicCheck = validateAuditDataDeterministically(MEDICAL_SCHEMA, auditRes.items, 'audit');
             addLog(i, `Deterministic Validator: ${deterministicCheck.correctionCount} fixes across ${deterministicCheck.failedBlocks.length} blocks.`, deterministicCheck.correctionCount > 0 ? 'warning' : 'success');
 
-            // STEP 4: Conditional QA (only failed blocks)
+            // STEP 4: Targeted recheck after audit validation failures
+            let afterAuditValidationItems: AuditItem[] = deterministicCheck.normalizedItems;
+            if (!deterministicCheck.isValid) {
+              setCurrentStep('auditing');
+              const failedQuestions = deterministicCheck.issues.map(issue => issue.questionKey.split('::')[1]);
+              addLog(i, `Audit validation failed for ${deterministicCheck.issues.length} fields. Running targeted re-check.`, 'warning');
+              const auditRecheck = await callWithRetry(
+                () => runTargetedRecheckAgent(file, MEDICAL_SCHEMA, failedQuestions, deterministicCheck.normalizedItems, 'AUDIT', (c, t) => setProgress({ current: c, total: t })),
+                'Targeted Recheck (Audit)'
+              );
+              trackUsage(auditRecheck.usage);
+              afterAuditValidationItems = mergeAuditedItems(deterministicCheck.normalizedItems, auditRecheck.items);
+            }
+
+            // STEP 5: Conditional QA (only failed blocks)
             let postQaItems: AuditItem[] = deterministicCheck.normalizedItems;
             if (deterministicCheck.failedBlocks.length > 0) {
               setCurrentStep('qa');
               addLog(i, `Agent 3: QA for flagged blocks only (${deterministicCheck.failedBlocks.length}).`, 'warning');
               const qaSchema = buildSchemaSubset(MEDICAL_SCHEMA, deterministicCheck.failedBlocks);
               const qaRes = await callWithRetry(
-                () => runQAAgent(file, deterministicCheck.normalizedItems, qaSchema, (c, t) => setProgress({ current: c, total: t })),
+                () => runQAAgent(file, afterAuditValidationItems, qaSchema, (c, t) => setProgress({ current: c, total: t })),
                 'Agent 3 (Conditional QA)'
               );
               trackUsage(qaRes.usage);
-              postQaItems = mergeAuditedItems(deterministicCheck.normalizedItems, qaRes.items);
+              postQaItems = mergeAuditedItems(afterAuditValidationItems, qaRes.items);
               addLog(i, `Agent 3: Conditional QA complete.`, 'success');
             } else {
+              postQaItems = afterAuditValidationItems;
               addLog(i, `Agent 3: Skipped (no deterministic failures).`, 'success');
             }
 
-            // STEP 5: Final deterministic gate (ensures export-compatible shape)
-            setCurrentStep('export_validation');
-            const finalValidation = validateAuditDataDeterministically(MEDICAL_SCHEMA, postQaItems);
-            addLog(i, `Final Validator: ${finalValidation.failedBlocks.length === 0 ? 'Structure locked for export.' : `Normalized ${finalValidation.correctionCount} residual fields.`}`, finalValidation.failedBlocks.length === 0 ? 'success' : 'warning');
+            // STEP 6: Validation after QA + targeted recheck for failed fields
+            const qaValidation = validateAuditDataDeterministically(MEDICAL_SCHEMA, postQaItems, 'qa');
+            let beforeExportItems: AuditItem[] = qaValidation.normalizedItems;
+            if (!qaValidation.isValid) {
+              setCurrentStep('qa');
+              const failedQuestions = qaValidation.issues.map(issue => issue.questionKey.split('::')[1]);
+              addLog(i, `QA validation failed for ${qaValidation.issues.length} fields. Running targeted re-check.`, 'warning');
+              const qaRecheck = await callWithRetry(
+                () => runTargetedRecheckAgent(file, MEDICAL_SCHEMA, failedQuestions, qaValidation.normalizedItems, 'QA', (c, t) => setProgress({ current: c, total: t })),
+                'Targeted Recheck (QA)'
+              );
+              trackUsage(qaRecheck.usage);
+              beforeExportItems = mergeAuditedItems(qaValidation.normalizedItems, qaRecheck.items);
+            }
 
-            // STEP 6: Supervisor POST (AGENT 4)
+            // STEP 7: Final deterministic gate before export (cannot be bypassed)
+            setCurrentStep('export_validation');
+            const finalValidation = validateAuditDataDeterministically(MEDICAL_SCHEMA, beforeExportItems, 'export');
+
+            if (!finalValidation.isValid) {
+              const structuredErrors = buildStructuredValidationErrorReport(finalValidation.issues);
+              addLog(i, `Export blocked: ${structuredErrors.length} unresolved validation errors.`, 'error');
+              addLog(i, `Validation report: ${JSON.stringify(structuredErrors)}`, 'error');
+              throw new Error(`Export blocked due to validation failures: ${JSON.stringify(structuredErrors)}`);
+            }
+
+            addLog(i, 'Final Validator: Structure locked for export.', 'success');
+
+            // STEP 8: Supervisor POST (AGENT 4)
             setCurrentStep('supervisor_post');
             const postCheck = await callWithRetry(() => runSupervisorAgent(file, 'POST', finalValidation.normalizedItems), 'Agent 4 (Supervisor Post)');
             trackUsage(postCheck.usage);
