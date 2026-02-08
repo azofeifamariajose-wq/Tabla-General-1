@@ -742,7 +742,7 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 14,
       "block_name": "14.Characteristics of Vaccines Used in the Study",
-      "notes": "Brand/manufacturer interpretation rules exist in the source text and should be applied during extraction/normalization.",
+      "notes": "Brand/manufacturer interpretation rules exist in the source text and should be applied during extraction/normalization. Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
             "section_name": "Vaccine Characteristics",
@@ -920,7 +920,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "Other",
                 "N/A"
               ],
-              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g3_brand_name",
@@ -951,7 +950,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "Other",
                 "N/A"
               ],
-              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g3_manufacturer",
@@ -972,21 +970,18 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "Other",
                 "N/A"
               ],
-              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g3_num_pertussis_ags",
               "label": "No. of pertussis ags included in the vaccine of Group 3",
               "type": "single_select",
               "options": ["1", "2", "3", "4", "5", "N/A"],
-              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g3_pertussis_antigens_types",
               "label": "Type(s) of pertussis antigens included in group 3 (PT, FHA, PRN, FIM2 and/or FIM3)",
               "type": "multi_select", // Assuming multi_select is a valid string type in your logic
               "options": ["PT", "FHA", "PRN", "FIM2", "FIM3", "N/A"],
-              "instruction": "If Group 3 is not present in the article, select 'N/A'."
             },
 
             {
@@ -1004,7 +999,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "Other",
                 "N/A"
               ],
-              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g4_brand_name",
@@ -1035,7 +1029,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "Other",
                 "N/A"
               ],
-              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g4_manufacturer",
@@ -1056,21 +1049,18 @@ export const MEDICAL_SCHEMA: SchemaDef = {
                 "Other",
                 "N/A"
               ],
-              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g4_num_pertussis_ags",
               "label": "No. of pertussis ags included in the vaccine of Group 4",
               "type": "single_select",
               "options": ["1", "2", "3", "4", "5", "N/A"],
-              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
             {
               "key": "vac_g4_pertussis_antigens_types",
               "label": "Type(s) of pertussis antigens included in group 4(PT, FHA, PRN, FIM2 and/or FIM3)",
               "type": "multi_select", // Assuming multi_select is a valid string type in your logic
               "options": ["PT", "FHA", "PRN", "FIM2", "FIM3", "N/A"],
-              "instruction": "If Group 4 is not present in the article, select 'N/A'."
             },
 
             { "key": "vac_more_than_4_groups_description", "label": "Description: same details if the study includes more than 4 groups", "type": "text" },
@@ -1126,6 +1116,7 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 15,
       "block_name": "15. 1st Pertussis Vaccine Dose, Primary Schedule",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
             "section_name": "1st Dose",
@@ -1362,6 +1353,7 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 16,
       "block_name": "16. 2nd Pertussis Vaccine Dose, Primary Schedule",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
             "section_name": "2nd Dose",
@@ -1598,6 +1590,7 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 17,
       "block_name": "17. 3rd Pertussis Vaccine Dose, Primary Schedule",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
             "section_name": "3rd Dose",
@@ -1834,6 +1827,7 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 18,
       "block_name": "18. Booster Schedule",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
             "section_name": "Booster",
@@ -2099,24 +2093,25 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 19,
       "block_name": "19. Primary + Booster",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
-            "section_name": "Primary + Booster",
-            "questions": [
+          "section_name": "Primary + Booster",
+          "questions": [
             {
-              "key": "pb_evaluates_both",
-              "label": "Does the study evaluates both primary + booster schedule?",
+              "key": "pb_linkage",
+              "label": "Does the study evaluates both primary + boster schedule?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             },
             {
-              "key": "pb_age_completion",
+              "key": "pb_attrition",
               "label": "Age of Completion of Primary + Booster Schedule",
               "type": "single_select",
-              "options": ["12-18months", "15-18 months", "18-24 months", "6-12 months", "other", "N/A"]
+              "options": ["12-18 months","15-18 months","6-12 months","Other","N/A"]
             },
-            {
-              "key": "pb_other_completion_age_description",
+             {
+              "key": "pb_time_interval",
               "label": "In case of other age of completion of the primary + booster schedule,  describe",
               "type": "text"
             }
@@ -2124,139 +2119,172 @@ export const MEDICAL_SCHEMA: SchemaDef = {
         }
       ]
     },
-
     {
       "block_number": 20,
       "block_name": "20. Primary Outcome",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
-            "section_name": "Primary Outcome",
-            "questions": [
-            { "key": "po_results_description", "label": "Results of Primary Outcome (description)", "type": "text" },
+          "section_name": "Persistence",
+          "questions": [
             {
-              "key": "po_achieved_immunogenicity",
+              "key": "Results of Primary Outcome (description)",
+              "label": "Results of Primary Outcome",
+              "type": "text"
+            },
+            {
+              "key": "Was Primary Outcone Achieved by Study Vaccine In Immunogenicity?",
               "label": "Was Primary Outcone Achieved by Study Vaccine In Immunogenicity?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             },
             {
-              "key": "po_achieved_safety",
+              "key": "Was Primary Outcone Achieved by Study Vaccine In Safety?",
               "label": "Was Primary Outcone Achieved by Study Vaccine In Safety?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             },
-            {
-              "key": "po_primary_series_completed_for_immunogenicity",
+             {
+              "key": "If the study analyzed primary schedule, all participants included for the immunogenicity analysis completed the primary series?",
               "label": "If the study analyzed primary schedule, all participants included for the immunogenicity analysis completed the primary series?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             },
-            {
-              "key": "po_booster_series_completed_for_immunogenicity",
+             {
+              "key": "If the study analyzed booster schedule, all participants included for the immunogenicity analysis completed the booster series?",
               "label": "If the study analyzed booster schedule, all participants included for the immunogenicity analysis completed the booster series?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             },
-            {
-              "key": "po_both_series_completed_for_immunogenicity",
+             {
+              "key": "If the study analyzed primary and booster schedules, all participants included for the immunogenicity analysis completed both?",
               "label": "If the study analyzed primary and booster schedules, all participants included for the immunogenicity analysis completed both?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             },
-            {
-              "key": "po_primary_series_completed_for_safety",
+             {
+              "key": "If the study analyzed primary scheduel, all participants included for the safety analysis completed the primary series?",
               "label": "If the study analyzed primary scheduel, all participants included for the safety analysis completed the primary series?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             },
-            {
-              "key": "po_booster_series_completed_for_safety",
+             {
+              "key": "If the study analyzed booster schedule, all participants included for the safety analysis completed the booster series?",
               "label": "If the study analyzed booster schedule, all participants included for the safety analysis completed the booster series?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             },
-            {
-              "key": "po_both_series_completed_for_safety",
+             {
+              "key": "If the study analyzed primary and booster schedules, all participants included for the safety analysis completed both?",
               "label": "If the study analyzed primary and booster schedules, all participants included for the safety analysis completed both?",
               "type": "single_select",
-              "options": ["Yes", "No", "Not described", "N/A", "Other", "Unknown"]
+              "options": ["Yes", "No", "Not described", "N/A","Other","Unknown"]
             }
           ]
         }
       ]
     },
-
     {
       "block_number": 21,
-      "block_name": "21. Results of Secondary Outcomes (description)",
+      "block_name": "21. Results of Secondary Outcomes",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
-            "section_name": "Secondary Outcomes",
-            "questions": [
-            { "key": "secondary_outcomes_results_description", "label": "21. Results of Secondary Outcomes (description)", "type": "text" }
+          "section_name": "Results of Secondary Outcomes",
+          "questions": [
+            {
+              "key": "Results of Secondary Outcomes",
+              "label": "Results of Secondary Outcomes (description)",
+              "type": "text"
+            }
           ]
         }
       ]
     },
     {
       "block_number": 22,
-      "block_name": "22 conclusions",
+      "block_name": "22.  Conclusions",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
-            "section_name": "Conclusions",
-            "questions": [
-            { "key": "conclusions", "label": "Conclusions", "type": "text" }
+          "section_name": " Conclusions",
+          "questions": [
+            {
+              "key": " Conclusions",
+              "label": " Conclusions",
+              "type": "text"
+            }
           ]
         }
       ]
     },
     {
       "block_number": 23,
-      "block_name": "23. Limitations (written in paper)",
+      "block_name": "Limitations",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
-            "section_name": "Limitations (Paper)",
-            "questions": [
-            { "key": "limitations_written_in_paper", "label": "Limitations (written in paper)", "type": "text" }
+          "section_name": "Limitations",
+          "questions": [
+            {
+              "key": "Limitations",
+              "label": "Limitations (written in paper)",
+              "type": "text"
+            }
           ]
         }
       ]
     },
     {
       "block_number": 24,
-      "block_name": "24. Observed Methodological Problems (by extractor)",
+      "block_name": "Observed Methodological Problems",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
-            "section_name": "Methodological Problems",
-            "questions": [
-            { "key": "observed_methodological_problems_by_extractor", "label": "Observed Methodological Problems (by extractor)", "type": "text" }
+          "section_name": "Observed Methodological Problems",
+          "questions": [
+            {
+              "key": "Observed Methodological Problems",
+              "label": "Observed Methodological Problems ",
+              "type": "text"
+            }
           ]
         }
       ]
     },
     {
       "block_number": 25,
-      "block_name": "Observed Limitatons  (by extractor)",
+      "block_name": "Observed Limitatons",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
-            "section_name": "Observed Limitations",
-            "questions": [
-            { "key": "observed_limitatons_by_extractor", "label": "Observed Methodological Problems (by extractor)", "type": "text" }
+          "section_name": "Observed Limitatons",
+          "questions": [
+            {
+              "key": "Observed Limitatons",
+              "label": "Observed Limitatons",
+              "type": "text"
+            }
           ]
         }
       ]
     },
     {
       "block_number": 26,
-      "block_name": "notes",
+      "block_name": "Notes",
+      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
-            "section_name": "Notes",
-            "questions": [
-            { "key": "notes_relevant", "label": "notes (relevant notes from the article)", "type": "text" }
+          "section_name": "Notes",
+          "questions": [
+            {
+              "key": "Notes",
+              "label": "Notes",
+              "type": "text"
+            }
           ]
         }
       ]
     }
   ]
-}
+};

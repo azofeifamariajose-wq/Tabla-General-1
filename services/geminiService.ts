@@ -50,6 +50,71 @@ const getSection14Reinforcement = (blockNumber: number): string => {
   - If evidence is absent after exhaustive review, return "Not described" instead of guessing.`;
 };
 
+const normalizeSelectAnswersAndMissingGroups = <T extends ExtractionItem | AuditItem>(
+  items: T[],
+  schemaDef: SchemaDef
+): T[] => {
+  const questionDefs = new Map<string, { options?: string[] }>();
+  for (const block of schemaDef.blocks) {
+    for (const section of block.sections) {
+      for (const question of section.questions) {
+        questionDefs.set(question.label, { options: question.options });
+      }
+    }
+  }
+
+  // Detect number of comparative groups when explicitly reported.
+  const comparativeCountItem = items.find(item =>
+    item.question.toLowerCase().includes('number of compartive groups described') ||
+    item.question.toLowerCase().includes('number of comparative groups described')
+  );
+  const comparativeCount = comparativeCountItem?.answer
+    ? Number((comparativeCountItem.answer.match(/\d+/) || [])[0])
+    : NaN;
+
+  const absentGroups = new Set<number>();
+  if (Number.isFinite(comparativeCount) && comparativeCount > 0) {
+    for (let g = comparativeCount + 1; g <= 8; g++) {
+      absentGroups.add(g);
+    }
+  }
+
+  return items.map(item => {
+    const normalized = { ...item };
+    const answer = (normalized.answer || '').trim();
+    const qMeta = questionDefs.get(item.question);
+    const options = qMeta?.options || [];
+    const allowsNA = options.some(opt => opt.toLowerCase() === 'n/a');
+
+    if (answer && allowsNA) {
+      const tokens = answer
+        .split(/[;,|]/)
+        .map(t => t.trim())
+        .filter(Boolean);
+      const hasNA = tokens.some(t => t.toLowerCase() === 'n/a');
+      if (hasNA && tokens.length > 1) {
+        normalized.answer = 'N/A';
+      }
+    }
+
+    const questionLower = item.question.toLowerCase();
+    for (const groupNumber of absentGroups) {
+      const groupRegex = new RegExp(`\\bgroup\\s*${groupNumber}\\b`, 'i');
+      if (groupRegex.test(questionLower) && allowsNA) {
+        normalized.answer = 'N/A';
+      }
+    }
+
+    if (Number.isFinite(comparativeCount) && comparativeCount < 4) {
+      if (/groups?\s*4\s*or\s*more/i.test(item.question) && allowsNA) {
+        normalized.answer = 'N/A';
+      }
+    }
+
+    return normalized;
+  });
+};
+
 // --- ROBUST JSON SANITIZER & REPAIR UTILS ---
 
 /**
@@ -432,8 +497,9 @@ export const runExtractionAgent = async (
   // --- APPLY CORRELATION BRANCH ADDON ---
   // Normalizes brands and manufacturers before returning results
   // const correlatedItems = applyCorrelationRules(allItems); // Correlation turned off per request
-  // Passing allItems directly instead of correlatedItems
-  const finalItems = allItems;
+  
+  // Apply Group Normalization (N/A for missing groups)
+  const finalItems = normalizeSelectAnswersAndMissingGroups(allItems, schemaDef);
 
   return { items: finalItems, usage: totalUsage };
 };
@@ -460,11 +526,16 @@ export const runAuditAgent = async (
     for (let i = 0; i < blockChunks.length; i++) {
         const chunk = blockChunks[i];
         const chunkData = chunk.flatMap(block => itemsByBlock[block.block_number] || []);
+        
+        // Check if the current chunk contains Block 14 (Vaccine Characteristics)
+        const hasBlock14 = chunk.some(b => b.block_number === 14);
+        const reinforcement = hasBlock14 ? getSection14Reinforcement(14) : "";
 
         const prompt = `STRICT MEDICAL AUDITOR. File: ${file.name}.
         Review all provided blocks and return one JSON array.
         MANDATES: enforce answer-question alignment, no blanks (use "N/A" only if truly absent), exact constants/options, schema order, and for multi-select questions include ALL applicable options separated by semicolons.
         INSTRUCTION SOURCE OF TRUTH: Use only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
+        ${reinforcement}
         OUTPUT FORMAT: Return a valid JSON array matching the schema.
         SCHEMA BLOCKS: ${compactJson(chunk)}
         CURRENT DATA: ${compactJson(chunkData)}`;
@@ -489,7 +560,9 @@ export const runAuditAgent = async (
 
         onProgress(i + 1, blockChunks.length);
     }
-    return { items: auditedItems, usage: totalUsage };
+    
+    const normalizedAuditedItems = normalizeSelectAnswersAndMissingGroups(auditedItems, schemaDef);
+    return { items: normalizedAuditedItems, usage: totalUsage };
   };
 
 export const runQAAgent = async (
@@ -515,10 +588,16 @@ export const runQAAgent = async (
     for (let i = 0; i < blockChunks.length; i++) {
         const chunk = blockChunks[i];
         const chunkData = chunk.flatMap(block => auditedByBlock[block.block_number] || []);
+        
+        // Check if the current chunk contains Block 14 (Vaccine Characteristics)
+        const hasBlock14 = chunk.some(b => b.block_number === 14);
+        const reinforcement = hasBlock14 ? getSection14Reinforcement(14) : "";
+
         const prompt = `FINAL QA AUTHORITY. File: ${file.name}.
         Validate these blocks for CSV integrity and return one JSON array.
         RULES: exact schema order, no missing fields, fill missing answers with "N/A", and for multi-select return all applicable options separated by semicolons.
         INSTRUCTION SOURCE OF TRUTH: Validate using only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
+        ${reinforcement}
         SCHEMA BLOCKS: ${compactJson(chunk)}
         AUDITED DATA: ${compactJson(chunkData)}`;
 
@@ -542,7 +621,9 @@ export const runQAAgent = async (
 
         onProgress(i + 1, blockChunks.length);
     }
-    return { items: finalQAItems, usage: totalUsage };
+    
+    const normalizedQAItems = normalizeSelectAnswersAndMissingGroups(finalQAItems, schemaDef);
+    return { items: normalizedQAItems, usage: totalUsage };
 };
 
 export const runExportValidationAgent = async (
@@ -568,10 +649,16 @@ export const runExportValidationAgent = async (
   for (let i = 0; i < blockChunks.length; i++) {
       const chunk = blockChunks[i];
       const chunkData = chunk.flatMap(block => dataByBlock[block.block_number] || []);
+
+      // Check if the current chunk contains Block 14 (Vaccine Characteristics)
+      const hasBlock14 = chunk.some(b => b.block_number === 14);
+      const reinforcement = hasBlock14 ? getSection14Reinforcement(14) : "";
+
       const prompt = `EXPORT VALIDATION AGENT. File: ${file.name}.
       Guarantee export integrity for all provided blocks.
       RULES: 1:1 mapping, exact question order, no blanks, keep values unless fixing structural/blank issues.
       INSTRUCTION SOURCE OF TRUTH: Enforce only constraints/instructions defined in constants.ts through the SCHEMA BLOCKS.
+      ${reinforcement}
       SCHEMA BLOCKS: ${compactJson(chunk)}
       CANDIDATE DATA: ${compactJson(chunkData)}`;
 
@@ -595,5 +682,7 @@ export const runExportValidationAgent = async (
 
       onProgress(i + 1, blockChunks.length);
   }
-  return { items: validatedItems, usage: totalUsage };
+  
+  const normalizedValidatedItems = normalizeSelectAnswersAndMissingGroups(validatedItems, schemaDef);
+  return { items: normalizedValidatedItems, usage: totalUsage };
 };

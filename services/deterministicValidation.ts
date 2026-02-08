@@ -1,3 +1,4 @@
+
 import { AuditItem, QuestionDef, SchemaDef } from '../types';
 
 const normalizeText = (value?: string) => (value || '').trim();
@@ -49,6 +50,14 @@ const normalizeMultiSelectValue = (value: string, options: string[]): string => 
     });
     if (wasMentioned) selected.push(option);
   }
+
+  // --- NEW LOGIC: Enforce exclusive N/A for multi-select ---
+  // If 'N/A' is selected, it must be the ONLY selection.
+  const naOption = options.find(opt => normalizeForCompare(opt) === 'n/a');
+  if (naOption && selected.includes(naOption)) {
+      return naOption;
+  }
+  // --- END NEW LOGIC ---
 
   if (selected.length === 0) {
     const na = options.find(opt => normalizeForCompare(opt) === 'n/a');
@@ -151,6 +160,6 @@ export const validateAuditDataDeterministically = (
   return {
     normalizedItems,
     failedBlocks: Array.from(failedBlockSet),
-    correctionCount,
+    correctionCount
   };
 };
