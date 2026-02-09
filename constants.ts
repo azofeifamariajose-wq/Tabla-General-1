@@ -2187,7 +2187,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 21,
       "block_name": "21. Results of Secondary Outcomes",
-      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
           "section_name": "Results of Secondary Outcomes",
@@ -2204,7 +2203,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 22,
       "block_name": "22.  Conclusions",
-      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
           "section_name": " Conclusions",
@@ -2221,7 +2219,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 23,
       "block_name": "Limitations",
-      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
           "section_name": "Limitations",
@@ -2238,7 +2235,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 24,
       "block_name": "Observed Methodological Problems",
-      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
           "section_name": "Observed Methodological Problems",
@@ -2255,7 +2251,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 25,
       "block_name": "Observed Limitatons",
-      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
           "section_name": "Observed Limitatons",
@@ -2272,7 +2267,6 @@ export const MEDICAL_SCHEMA: SchemaDef = {
     {
       "block_number": 26,
       "block_name": "Notes",
-      "notes": "Group handling rule: if a referenced group is not present in the article, all questions for that missing group must be answered as 'N/A'.",
       "sections": [
         {
           "section_name": "Notes",
