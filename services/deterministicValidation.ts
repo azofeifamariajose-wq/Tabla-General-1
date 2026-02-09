@@ -223,14 +223,19 @@ export const validateAuditDataDeterministically = (
               normalizedItem.reasoning = 'N/A';
               normalizedItem.status = 'CORRECTED';
               normalizedItem.auditor_notes = `Group ${group} not present in source. Forced to N/A.`;
-              issues.push({
-                questionKey,
-                currentAnswer: source?.answer || '',
-                reason: `Question depends on Group ${group}, but source declares fewer groups.`,
-                recheckStep
-              });
-              correctionCount++;
-              failedBlockSet.add(block.block_number);
+              
+              // On export we can safely auto-correct group-dependent overflow fields.
+              // Keep hard failures for earlier stages to trigger targeted re-checks.
+              if (recheckStep !== 'export') {
+                issues.push({
+                  questionKey,
+                  currentAnswer: source?.answer || '',
+                  reason: `Question depends on Group ${group}, but source declares fewer groups.`,
+                  recheckStep
+                });
+                correctionCount++;
+                failedBlockSet.add(block.block_number);
+              }
               break;
             }
           }
