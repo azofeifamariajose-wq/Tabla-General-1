@@ -70,6 +70,12 @@ const normalizeSelectAnswersAndMissingGroups = <T extends ExtractionItem | Audit
   items: T[],
   schemaDef: SchemaDef
 ): T[] => {
+  const normalizeQuestion = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : '';
+
+  const normalizeOption = (value: unknown): string =>
+    typeof value === 'string' ? value.trim().toLowerCase() : '';
+
   const questionDefs = new Map<string, { options?: string[] }>();
   for (const block of schemaDef.blocks) {
     for (const section of block.sections) {
@@ -81,8 +87,8 @@ const normalizeSelectAnswersAndMissingGroups = <T extends ExtractionItem | Audit
 
   // Detect number of comparative groups when explicitly reported.
   const comparativeCountItem = items.find(item =>
-    item.question.toLowerCase().includes('number of compartive groups described') ||
-    item.question.toLowerCase().includes('number of comparative groups described')
+    normalizeQuestion(item.question).toLowerCase().includes('number of compartive groups described') ||
+    normalizeQuestion(item.question).toLowerCase().includes('number of comparative groups described')
   );
   const comparativeCount = comparativeCountItem?.answer
     ? Number((comparativeCountItem.answer.match(/\d+/) || [])[0])
@@ -97,10 +103,11 @@ const normalizeSelectAnswersAndMissingGroups = <T extends ExtractionItem | Audit
 
   return items.map(item => {
     const normalized = { ...item };
+    const questionText = normalizeQuestion(item.question);
     const answer = (normalized.answer || '').trim();
-    const qMeta = questionDefs.get(item.question);
+    const qMeta = questionDefs.get(questionText);
     const options = qMeta?.options || [];
-    const allowsNA = options.some(opt => opt.toLowerCase() === 'n/a');
+    const allowsNA = options.some(opt => normalizeOption(opt) === 'n/a');
 
     if (answer && allowsNA) {
       const tokens = answer
@@ -113,7 +120,7 @@ const normalizeSelectAnswersAndMissingGroups = <T extends ExtractionItem | Audit
       }
     }
 
-    const questionLower = item.question.toLowerCase();
+    const questionLower = questionText.toLowerCase();
     for (const groupNumber of absentGroups) {
       const groupRegex = new RegExp(`\\bgroup\\s*${groupNumber}\\b`, 'i');
       if (groupRegex.test(questionLower) && allowsNA) {
@@ -122,7 +129,7 @@ const normalizeSelectAnswersAndMissingGroups = <T extends ExtractionItem | Audit
     }
 
     if (Number.isFinite(comparativeCount) && comparativeCount < 4) {
-      if (/groups?\s*4\s*or\s*more/i.test(item.question) && allowsNA) {
+      if (/groups?\s*4\s*or\s*more/i.test(questionText) && allowsNA) {
         normalized.answer = 'N/A';
       }
     }
